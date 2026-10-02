@@ -70,3 +70,35 @@ validation passed again. The existing HTTPX TestClient deprecation warning remai
 All real PostgreSQL HTTP scenarios and their durations remain NOT RUN; recovery
 without restarting the API is unverified. Service state could not be listed.
 No services or volumes were changed. Overall verification remains BLOCKED.
+
+## Readiness deadline defect and fix (2026-10-02)
+
+User-reported real Docker evidence before this fix:
+- Database running: live 200 in 0.084358s; ready 200 in 0.051103s.
+- PostgreSQL stopped: live 200 in 0.002993s; readiness timed out after
+  10.020181s, curl exit 28 / HTTP 000 (no HTTP response).
+
+Confirmed defect: no end-to-end readiness deadline. Synchronous psycopg connection
+timeouts apply per resolved address and do not bound DNS; server statement
+timeouts do not bound client-side network waits. NullPool means no acquisition
+queue or stale pooled connection was involved. The sync FastAPI handler ran in a
+worker thread, but hung checks could retain workers. The precise stalled phase
+in the user's run is untraced; Docker DNS after stopping postgres is plausible,
+not proven by a trace.
+
+Fix: disposable subprocess with a 2-second whole-operation deadline, kill/reap
+on timeout or task cancellation, and one in-flight probe per API process.
+Overlapping checks return sanitized 503. This bounds DNS and driver stalls
+without pretending thread cancellation stops blocking I/O. Driver connect_timeout
+is 2s, statement_timeout 1s, tcp_user_timeout 1.5s; NullPool retains no sockets or
+acquisition queue. Liveness stays independent; recovery uses a fresh connection.
+The local HTTP target is under 3 seconds including cleanup and scheduling.
+
+Verification: 12 tests passed, including actual stalled subprocess kill/reap,
+repeated checks, concurrent liveness, overlap rejection, cancellation, recovery,
+and connection/engine cleanup. Ruff lint and formatting passed. The existing
+HTTPX TestClient warning remains; dependencies unchanged.
+Docker info still fails in this agent session with socket permission denied;
+process groups are agent/sudo/users. Real PostgreSQL checks after the fix are
+NOT RUN and pending using README's bounded assertion commands. No services,
+volumes, or data were changed. Milestone 2 was not started.

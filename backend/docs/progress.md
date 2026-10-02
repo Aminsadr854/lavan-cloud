@@ -54,3 +54,19 @@ No services were started, stopped, or restarted; their initial state is unknown
 and was left unchanged. No volumes or database data were modified or deleted.
 No application defect was demonstrated. Milestone 1 is not ready to close until
 the README real PostgreSQL sequence passes. Milestone 2 was not started.
+
+## Docker group refresh follow-up (2026-10-02)
+
+The user reports Docker works in their fresh WSL terminal. Read-only checks in
+this agent execution environment confirm `getent group docker` now lists `agent`,
+but `id` still shows only groups `agent`, `sudo`, and `users`. The existing agent
+process has stale supplementary groups. `docker info` and Compose service listing
+still fail with socket permission denied. Restart the agent execution session
+from a fresh WSL login that has Docker access, then repeat the README sequence.
+No group memberships, socket permissions, contexts, or system settings were changed.
+
+Locked installation, Ruff lint, Ruff formatting, all 9 tests, and quiet Compose
+validation passed again. The existing HTTPX TestClient deprecation warning remains.
+All real PostgreSQL HTTP scenarios and their durations remain NOT RUN; recovery
+without restarting the API is unverified. Service state could not be listed.
+No services or volumes were changed. Overall verification remains BLOCKED.

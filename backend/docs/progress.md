@@ -195,3 +195,60 @@ Apply the explicit README migration command when ready to upgrade development.
 
 Next milestone: development user provisioning and API-token authentication.
 It has not been started.
+
+## Milestone 3 completed (2026-10-16)
+
+Added explicit `python -m lavan.manage` commands: create-user, issue-token for an
+existing UUID user, and idempotent revoke-token by UUID identifier. Tokens contain
+32 cryptographically random bytes; only SHA-256 of the complete token is stored.
+Raw issuance output occurs only after successful commit. Tokens have no expiration
+in this initial policy and remain valid until revoked. No default users/tokens,
+public registration, passwords, JWTs, or project endpoints were added.
+
+Added api_tokens and revision `0002_api_tokens` after unchanged
+`0001_users_projects`: UUID identifiers, restricted user FK, unique indexed digest,
+UTC created_at and nullable revoked_at. Revoked tokens also prevent user deletion.
+Reusable authenticated_user reads only Authorization: Bearer credentials and
+returns sanitized 401 with WWW-Authenticate for missing/malformed/unknown/revoked
+tokens. GET /v1/me exposes only id and created_at. Unexpected database failures
+produce sanitized 503 rather than 401. Scoped synchronous sessions and handlers
+run off the event loop; sessions close on request completion. Health probe logic
+is unchanged. Docker Uvicorn access logging is disabled to avoid query-string
+credential leakage, and no authorization headers or secrets are logged.
+
+Verification:
+- Locked dependency synchronization, Ruff lint and formatting passed; no dependency
+  upgrade was needed.
+- `LAVAN_POSTGRES_TESTS=1 uv run pytest`: 42 passed, zero failed/skipped.
+  Includes existing user/project and health checks, real PostgreSQL provisioning,
+  token digest/no-raw-column verification, valid/invalid authentication, independent
+  and idempotent revocation, unknown-ID errors, unique/FK/deletion constraints,
+  failed-commit output suppression, session cleanup/off-loop execution, migration
+  downgrade/re-upgrade, and metadata drift checks. All downgrade targets were
+  uniquely created disposable databases. The existing HTTPX warning remains.
+- Docker image build passed. Confirmed the Compose target was local lavan_dev at
+  0001_users_projects with no token table conflict before upgrade. Applied only
+  upgrade head to development. Alembic current/heads both report 0002_api_tokens;
+  Alembic check reports no pending operations.
+
+Actual API smoke test against PostgreSQL (token captured in memory, never printed):
+
+| Request | HTTP | Seconds |
+| --- | --- | --- |
+| /v1/me with valid token | 200 | 0.114379 |
+| /v1/me after revocation | 401 | 0.014290 |
+| /health/live without credentials | 200 | 0.001832 |
+| /health/ready without credentials | 200 | 1.179435 |
+
+The 200 response matched the provisioned user and contained only id/created_at;
+the 401 response and WWW-Authenticate: Bearer header were asserted.
+Retained explicitly identified local verification records in lavan_dev:
+- User ID: 8f61a1ef-dffa-4d65-87a0-04d5d4076b6f
+- Revoked token ID: 8757af5c-0a46-4ce7-a572-f8da98fa5e61
+
+No raw token is retained in this document or any tracked file. Development data
+and volumes were preserved; no development downgrade/reset/stamp or unrelated
+record deletion occurred. Initial/final service state: PostgreSQL running/healthy,
+API stopped (exit 0). No verification checks remain blocked.
+
+Next milestone: authenticated project creation and retrieval. It has not started.

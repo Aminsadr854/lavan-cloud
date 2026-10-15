@@ -1,6 +1,5 @@
 """Real PostgreSQL tests; only this fixture creates the downgrade target."""
 
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -10,83 +9,12 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from psycopg import sql
-from sqlalchemy import create_engine, inspect, select, text, update
+from conftest import migration
+from sqlalchemy import inspect, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import NullPool
 
-from lavan.config import Settings
 from lavan.models import Base, Project, User
-
-
-@pytest.fixture(scope="module")
-def database():
-    if os.environ.get("LAVAN_POSTGRES_TESTS") != "1":
-        pytest.skip("Enable real PostgreSQL tests with LAVAN_POSTGRES_TESTS=1")
-    settings = Settings()
-    name = "lavan_m2_test_" + uuid4().hex
-    assert name != settings.postgres_db
-    admin = create_engine(
-        settings.database_url,
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-        connect_args={"connect_timeout": 2},
-        hide_parameters=True,
-    )
-    engine = None
-    created = False
-    try:
-        with admin.connect() as connection:
-            raw = connection.connection.driver_connection
-            raw.execute(
-                sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
-                    sql.Identifier(name)
-                )
-            )
-            created = True
-        engine = create_engine(
-            settings.database_url.set(database=name),
-            poolclass=NullPool,
-            connect_args={
-                "connect_timeout": 2,
-                "options": "-c timezone=UTC -c statement_timeout=10000",
-            },
-            hide_parameters=True,
-        )
-        assert engine.url.database == name
-        with engine.connect() as connection:
-            assert connection.scalar(text("SELECT current_database()")) == name
-            assert inspect(connection).get_table_names() == []
-        yield engine, name
-    finally:
-        if engine is not None:
-            engine.dispose()
-        if created:
-            # The exact UUID name was created above, never supplied by the caller.
-            assert name.startswith("lavan_m2_test_") and name != settings.postgres_db
-            with admin.connect() as connection:
-                connection.connection.driver_connection.execute(
-                    sql.SQL("DROP DATABASE {}").format(sql.Identifier(name))
-                )
-        admin.dispose()
-
-
-def migration(engine, name, operation, revision):
-    assert engine.url.database == name and name.startswith("lavan_m2_test_")
-    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
-    with engine.connect() as connection:
-        assert connection.scalar(text("SELECT current_database()")) == name
-        connection.rollback()
-        config.attributes["connection"] = connection
-        operation(config, revision)
-
-
-@pytest.fixture(scope="module")
-def migrated(database):
-    engine, name = database
-    migration(engine, name, command.upgrade, "head")
-    return engine, name
 
 
 def test_initial_upgrade_and_idempotence(migrated):
@@ -97,6 +25,7 @@ def test_initial_upgrade_and_idempotence(migrated):
             "users",
             "projects",
             "alembic_version",
+            "api_tokens",
         }
         assert inspector.get_pk_constraint("users")["name"] == "pk_users"
         assert inspector.get_pk_constraint("projects")["name"] == "pk_projects"
@@ -128,7 +57,7 @@ def test_initial_upgrade_and_idempotence(migrated):
             (c["name"], str(c["type"]), c["default"]) for c in after
         ]
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0001_users_projects"
+            "0002_api_tokens"
         )
 
 

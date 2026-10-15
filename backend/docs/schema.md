@@ -1,4 +1,4 @@
-# Milestone 2 schema
+# Database schema (milestones 2–3)
 
 `users`: application-generated UUID primary key and non-null `created_at`
 (`timestamptz`, database `now()` default). There are no identity or auth fields.
@@ -28,3 +28,24 @@ Migrations are explicit. Neither API startup nor health endpoints create tables
 or run migrations. The initial migration creates users, projects, and the owner
 index; its downgrade removes those application tables. Downgrade is destructive
 and is exercised only in a new disposable test database.
+
+## API tokens (milestone 3)
+
+`api_tokens`: application-generated UUID `id`, non-null indexed UUID `user_id`,
+non-null `digest` (`varchar(64)`), non-null timezone-aware `created_at` with database
+`now()` default, and nullable timezone-aware `revoked_at`. There is no raw-token
+column. `uq_api_tokens_digest` creates a unique PostgreSQL index on the SHA-256
+hex digest. `fk_api_tokens_user_id_users` uses `ON DELETE RESTRICT`, including
+for revoked tokens. UUID and timestamp conventions match the existing models.
+
+Management issuance generates 32 random bytes using Python secrets, encodes them
+as URL-safe text with an `lv_` prefix, and hashes the **full token**. It prints raw
+token material only after commit. Authentication compares the digest via the
+unique index and requires revoked_at IS NULL. Token IDs are management identifiers,
+not credentials. Revocation sets revoked_at using the database UTC instant and
+preserves the first revocation time on repeated calls. Tokens do not expire in
+this initial policy. No default accounts/tokens, identity fields, or cascades exist.
+
+Revision `0002_api_tokens` adds only api_tokens and its indexes. Its downgrade
+removes only that table, preserving users/projects, and is tested only in the
+fixture-created disposable databases. `0001_users_projects` is unchanged.

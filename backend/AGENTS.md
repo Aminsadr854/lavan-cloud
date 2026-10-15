@@ -1,6 +1,7 @@
 # Scope
-Milestones 1–2: local FastAPI/PostgreSQL infrastructure, users/projects models,
-and explicit Alembic migrations. Do not add authentication, provisioning, uploads,
+Milestones 1–3: local FastAPI/PostgreSQL infrastructure, users/projects models,
+explicit Alembic migrations, local user provisioning, and API-token authentication.
+Do not add project endpoints, uploads,
 workers, runners, or CI without a new milestone request.
 Keep secrets and runtime data outside Git. Preserve unrelated work.
 
@@ -13,3 +14,6 @@ Commit coherent verified checkpoints. Normal shutdown must preserve database dat
 Run real schema tests with `LAVAN_POSTGRES_TESTS=1 uv run pytest`. They create
 and remove a uniquely named disposable database; never downgrade development data.
 Read docs/schema.md for the supported timestamp write path.
+
+Never log raw API tokens, authorization headers, or credentials. Token output is
+allowed only after successful issuance commit through the local management command.

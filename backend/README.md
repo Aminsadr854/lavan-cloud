@@ -1,8 +1,8 @@
-# Lavan backend: milestones 1–2
+# Lavan backend: milestones 1–3
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
-and two Compose services. No authentication or business endpoints.
+and two Compose services. Opaque API-token authentication and /v1/me; no project endpoints.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -38,7 +38,7 @@ volume. Changing the environment does not change an initialized database passwor
 Do not commit `.env`. Required settings fail validation at API startup without
 printing input values. Compose uses the internal PostgreSQL hostname; `.env` uses
 localhost for optional host execution (`uv run uvicorn lavan.api:app --host
-127.0.0.1 --port 8000` while only `docker compose up -d postgres` is running).
+127.0.0.1 --port 8000 --no-access-log` while only `docker compose up -d postgres` is running).
 
 ## Run and verify against real PostgreSQL
 
@@ -137,7 +137,7 @@ services. Never delete volumes or database data.
 ## Milestone 2: users/projects and explicit migrations
 
 See [docs/schema.md](docs/schema.md) for columns, ownership constraints, deletion
-policy, and UTC timestamp behavior. No authentication or business endpoints exist.
+policy, and UTC timestamp behavior. Milestone 2 added no authentication or business endpoints; token authentication is described below.
 Neither startup nor readiness applies migrations automatically.
 
 From WSL, with PostgreSQL running and the existing `.env` retained:
@@ -187,3 +187,74 @@ and downgrade/re-upgrade. No separate test database credentials are committed.
 
 After changes, rebuild/start the API and recheck health using the earlier README
 commands, then restore the initial service state without deleting volumes.
+
+## Milestone 3: development users and API tokens
+
+Run migrations first. There is no registration endpoint and no automatic user or
+token creation. Tokens are opaque `lv_` values with 32 cryptographically random
+bytes (256 bits). Only SHA-256 of the complete token is stored. Tokens have **no
+expiration in this initial policy**: they remain valid until explicitly revoked.
+Revocation is idempotent; it does not delete the token or its user. A user with
+any associated token, including revoked tokens, cannot be deleted.
+
+Host commands from backend/ (using the existing `.env` and locked environment):
+
+```bash
+uv run python -m lavan.manage create-user
+USER_ID="<returned-user-uuid>"
+set +x  # Keep secret-bearing variable expansions out of shell tracing.
+ISSUED=$(uv run python -m lavan.manage issue-token "$USER_ID")
+TOKEN_ID=$(printf '%s' "$ISSUED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token_id"])')
+API_TOKEN=$(printf '%s' "$ISSUED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+unset ISSUED
+```
+
+Each command emits JSON on stdout. Issuance emits the raw token **only after the
+transaction commits**. Capture it securely; do not echo the variable, paste its
+literal value into shell history, or commit it. Unknown users/tokens produce a
+sanitized error on stderr and a nonzero exit status. Invalid UUID arguments fail
+argument validation. Database failures never print credentials or internal errors.
+
+Docker equivalents (after `docker compose build api`); choose host or Docker
+commands, rather than issuing twice unintentionally:
+
+```bash
+docker compose run --rm --no-deps -T api /app/.venv/bin/python -m lavan.manage create-user
+# Capture this command's stdout as ISSUED, then parse it as above:
+ISSUED=$(docker compose run --rm --no-deps -T api /app/.venv/bin/python -m lavan.manage issue-token "$USER_ID")
+docker compose run --rm --no-deps -T api /app/.venv/bin/python -m lavan.manage revoke-token "<token-uuid>"
+```
+
+Use only the Authorization header, conceptually `Authorization: Bearer <token>`.
+The following sends it via curl stdin so the token is absent from command history
+and curl process arguments. API responses include only the user's `id` and
+`created_at`, never token identifiers, raw tokens, or digests.
+
+```bash
+docker compose up -d --wait --wait-timeout 60
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --fail-with-body --max-time 5 http://127.0.0.1:8000/v1/me
+uv run python -m lavan.manage revoke-token "$TOKEN_ID"
+# Repeat revocation safely:
+uv run python -m lavan.manage revoke-token "$TOKEN_ID"
+# Expected HTTP 401 with WWW-Authenticate: Bearer after revocation:
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - -i --max-time 5 http://127.0.0.1:8000/v1/me
+unset API_TOKEN TOKEN_ID
+curl --fail-with-body --max-time 3 http://127.0.0.1:8000/health/live
+curl --fail-with-body --max-time 3 http://127.0.0.1:8000/health/ready
+```
+
+Missing, malformed, unknown, and revoked tokens return the same sanitized 401.
+Query parameters are never credentials. Unexpected database errors return a
+sanitized 503, not 401. Health endpoints remain unauthenticated. Synchronous
+SQLAlchemy dependencies and /v1/me run in FastAPI's worker pool, using scoped
+sessions closed after requests. The separate bounded readiness probe is unchanged.
+The Docker command disables Uvicorn access logs to avoid recording query strings;
+use `--no-access-log` for host Uvicorn too. Never enable header/token logging.
+
+Run `LAVAN_POSTGRES_TESTS=1 uv run pytest` for real disposable-database tests,
+plus the existing Ruff checks. The new revision is `0002_api_tokens`, following
+`0001_users_projects`. Only disposable tests downgrade. Restore your prior API
+service state after manual verification, preserve volumes, and retain explicitly
+identified verification users/revoked tokens rather than deleting unrelated data.

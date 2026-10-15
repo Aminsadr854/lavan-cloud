@@ -1,11 +1,19 @@
 import asyncio
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Annotated
+from uuid import UUID
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
+from lavan.auth import authenticated_user
 from lavan.config import Settings
+from lavan.db import database_engine
+from lavan.models import User
 
 READINESS_TIMEOUT = 2.0
 PROBE_COMMAND = (sys.executable, "-m", "lavan.probe")
@@ -34,12 +42,21 @@ async def run_probe() -> bool:
             await process.wait()
 
 
+class UserResponse(BaseModel):
+    id: UUID
+    created_at: datetime
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         Settings()  # Validate required configuration at startup.
         app.state.probe_lock = asyncio.Lock()
-        yield
+        app.state.auth_engine = database_engine()
+        try:
+            yield
+        finally:
+            await run_in_threadpool(app.state.auth_engine.dispose)
 
     app = FastAPI(lifespan=lifespan)
 
@@ -57,6 +74,10 @@ def create_app() -> FastAPI:
             if not await run_probe():
                 return unavailable
         return {"status": "ready"}
+
+    @app.get("/v1/me", response_model=UserResponse)
+    def me(user: Annotated[User, Depends(authenticated_user)]):
+        return {"id": user.id, "created_at": user.created_at}
 
     return app
 

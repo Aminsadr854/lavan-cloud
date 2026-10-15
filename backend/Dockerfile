@@ -6,6 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_LINK_MODE=copy
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY lavan ./lavan
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN useradd --create-home app
 USER app
 EXPOSE 8000

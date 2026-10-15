@@ -1,7 +1,8 @@
-# Lavan: milestone 1
+# Lavan backend: milestones 1–2
 
-Local FastAPI infrastructure only. Python 3.12, PostgreSQL 17, SQLAlchemy,
-Pydantic settings, and two Compose services. No business tables or migrations.
+Local FastAPI infrastructure with minimal users/projects models and explicit
+Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
+and two Compose services. No authentication or business endpoints.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -132,3 +133,57 @@ restart PostgreSQL with the bounded command above. Restore prior service state:
 if both were stopped, use `docker compose stop --timeout 10`; if both were running,
 leave them running. For a mixed initial state, stop only initially stopped
 services. Never delete volumes or database data.
+
+## Milestone 2: users/projects and explicit migrations
+
+See [docs/schema.md](docs/schema.md) for columns, ownership constraints, deletion
+policy, and UTC timestamp behavior. No authentication or business endpoints exist.
+Neither startup nor readiness applies migrations automatically.
+
+From WSL, with PostgreSQL running and the existing `.env` retained:
+
+```bash
+cd /home/agent/lavan/backend
+export PATH="/tmp/lavan-uv/bin:$PATH"  # Or your existing uv installation.
+uv sync --locked
+docker compose up -d --wait --wait-timeout 60 postgres
+uv run alembic upgrade head
+uv run alembic current
+uv run alembic check
+```
+
+The WSL command uses the existing POSTGRES_* settings (`POSTGRES_HOST=127.0.0.1`
+for host execution). Credentials stay in environment/.env and never in alembic.ini.
+For Docker execution, rebuild the API image first; Compose supplies the internal
+`postgres` hostname and the same configured credentials:
+
+```bash
+docker compose build api
+docker compose run --rm --no-deps api /app/.venv/bin/alembic upgrade head
+docker compose run --rm --no-deps api /app/.venv/bin/alembic current
+```
+
+Choose either migration path. Upgrading to head is idempotent. Never downgrade or
+reset the development database to test migrations, and never delete its volume.
+
+### Real PostgreSQL integration tests
+
+```bash
+uv sync --locked
+uv run ruff check .
+uv run ruff format --check .
+LAVAN_POSTGRES_TESTS=1 uv run pytest
+```
+
+The test role (from existing settings) needs CREATEDB permission. The suite
+creates a new `lavan_m2_test_<random UUID>` database using template0, verifies the
+actual connected database before downgrade, and drops only the database it just
+created in fixture cleanup. It does not migrate, truncate, or downgrade the
+configured development database. Connection/query waits are bounded. Failed
+connections fail tests; PostgreSQL is never replaced by SQLite. Without the
+explicit flag, schema tests are skipped; those skips are not integration passes.
+Tests cover schema upgrade/idempotence, constraints, timestamps, metadata drift,
+and downgrade/re-upgrade. No separate test database credentials are committed.
+
+After changes, rebuild/start the API and recheck health using the earlier README
+commands, then restore the initial service state without deleting volumes.

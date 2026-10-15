@@ -146,3 +146,52 @@ Finally restored the initial state: PostgreSQL running/healthy, API stopped
 changes were necessary; prior automated test results remain as documented above
 and were not rerun for this documentation-only update. The previously pending
 real database verification is now complete. Milestone 2 was not started.
+
+## Milestone 2 completed (2026-10-15)
+
+Added SQLAlchemy User and Project models, named ownership/name constraints and
+owner index, settings-driven Alembic configuration, and initial revision
+`0001_users_projects` with upgrade/downgrade. Application-generated UUIDs and
+UTC-aware timestamps are documented in schema.md. SQLAlchemy insert/onupdate
+maintains updated_at; raw SQL writers must supply it. No business endpoints,
+authentication, provisioning, or automatic schema creation/migration were added.
+Milestone-1 API and readiness code are unchanged.
+
+Verified:
+- `uv sync --locked` succeeded with Alembic 1.20.0 added to the lockfile.
+- Ruff lint and formatting checks passed.
+- `LAVAN_POSTGRES_TESTS=1 uv run pytest`: 25 passed, zero skipped/failed.
+  Includes 12 existing health tests and 13 real PostgreSQL schema tests.
+- Tests verified empty upgrade, idempotence, persistence, FK rejection,
+  blank/whitespace and overlength rejection, duplicate/max-length names,
+  restricted owner deletion, UTC defaults, ORM/Core updated_at behavior,
+  no pending metadata changes, and downgrade/re-upgrade. Target database names
+  and actual current_database() were checked before destructive migration calls.
+- Docker image build and quiet Compose configuration validation passed.
+- Container Alembic upgrade, repeat upgrade, check, downgrade, and re-upgrade
+  passed against another newly created disposable database.
+- All generated `lavan_m2_test_<UUID>` databases were dropped; remaining count 0.
+- The existing upstream HTTPX TestClient deprecation warning remains. No checks
+  are blocked; no PostgreSQL integration tests were substituted with SQLite.
+
+Real runtime results after rebuilding:
+
+| Scenario | Endpoint | HTTP | Seconds |
+| --- | --- | --- | --- |
+| Healthy | live | 200 | 0.018253 |
+| Healthy | ready | 200 | 1.017610 |
+| PostgreSQL stopped | live | 200 | 0.001352 |
+| Outage probe 1 | ready | 503 | 1.009448 |
+| Outage probe 2 | ready | 503 | 1.042481 |
+| Outage probe 3 | ready | 503 | 1.137331 |
+| Recovered | ready | 200 | 1.123477 |
+| Recovered | live | 200 | 0.001134 |
+
+Statuses, exact sanitized response bodies, and <3-second timings were asserted.
+Recovery used the unchanged API container. Restored initial state: PostgreSQL
+running/healthy, API stopped (exit 0). Development data/volume preserved; migrations
+were executed only against newly created disposable databases, not development.
+Apply the explicit README migration command when ready to upgrade development.
+
+Next milestone: development user provisioning and API-token authentication.
+It has not been started.

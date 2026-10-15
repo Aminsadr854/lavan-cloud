@@ -3,3 +3,8 @@
 !uv.lock
 !lavan/
 !lavan/*.py
+!alembic.ini
+!migrations/
+!migrations/**
+**/__pycache__/
+**/*.py[cod]

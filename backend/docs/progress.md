@@ -252,3 +252,58 @@ record deletion occurred. Initial/final service state: PostgreSQL running/health
 API stopped (exit 0). No verification checks remain blocked.
 
 Next milestone: authenticated project creation and retrieval. It has not started.
+
+## Milestone 4 completed (2026-10-16)
+
+Added exactly authenticated POST /v1/projects and GET /v1/projects/{project_id}.
+Creation accepts only a strict string name, strips surrounding whitespace, and
+validates 1–100 trimmed characters. Extra fields, including ownership and IDs,
+are forbidden. Ownership is derived from authenticated_user. Duplicate names
+remain allowed. Creation commits the project and returns 201 with a relative
+Location header. Responses expose only id, name, created_at, and updated_at.
+Retrieval filters both project ID and authenticated owner ID in PostgreSQL;
+nonexistent and other-owner records produce identical sanitized 404 responses.
+Malformed UUIDs produce 422 for authenticated callers.
+
+The existing cached session/authentication dependencies are reused; synchronous
+handlers run in worker threads. Sessions close on success and error, and failed
+transactions roll back. Database errors remain sanitized 503; invalid credentials
+remain 401. The database constraints and bounded health implementation are unchanged.
+No schema, migration, or dependency changes; head remains 0002_api_tokens.
+
+Verified:
+- `LAVAN_POSTGRES_TESTS=1 uv run pytest`: 65 passed, zero failed/skipped.
+  Includes 23 new real PostgreSQL project tests, all existing auth/health/schema
+  tests, ownership isolation, validation, duplicate/max-length names, Location and
+  timestamp fields, failed-commit rollback, off-loop I/O and session cleanup.
+  Alembic metadata comparison remains clean. Existing HTTPX warning remains.
+- Ruff lint/format, locked dependency installation, quiet Compose validation,
+  and Docker image build passed.
+- Real HTTP smoke test used two explicitly provisioned users against lavan_dev;
+  raw tokens were captured only in memory and never printed or written to disk.
+
+| HTTP smoke scenario | Status | Seconds |
+| --- | --- | --- |
+| A creates a trimmed-name project | 201 | 0.105166 |
+| A retrieves the project | 200 | 0.013046 |
+| B requests A's project | 404 | 0.013733 |
+| Nonexistent project | 404 | 0.012297 |
+| Unauthenticated retrieval | 401 | 0.002551 |
+| Unauthenticated creation | 401 | 0.001825 |
+| Liveness | 200 | 0.001253 |
+| Readiness | 200 | 1.034009 |
+
+Asserted Location, exact response fields, trimmed name, ownership and nonexistent
+404 body equality, authentication header, and healthy endpoint bodies.
+Retained explicitly identified local verification records:
+- User A: 2a2aa976-cdda-4519-8dd5-25b42c65774b
+- User B: 51d98b7f-ee27-4e37-a243-c41b8ec6024d
+- Project owned by A: 70529a14-64a6-4d4f-a9f5-a7c154e4380c
+- Revoked A token ID: b67b655b-8bb8-44c7-bab7-65036fa40e23
+- Revoked B token ID: 8e18df7b-e07a-4b03-86b1-15f2a0d861af
+
+Both smoke-test tokens were revoked in finally cleanup. Development data/volumes
+and unrelated records were preserved. Disposable test databases were removed.
+Initial/final service state: PostgreSQL running/healthy, API stopped (exit 0).
+No checks are blocked. Next milestone: private ZIP artifact upload and validation.
+It has not been started.

@@ -1,8 +1,8 @@
 # Scope
-Milestones 1–3: local FastAPI/PostgreSQL infrastructure, users/projects models,
-explicit Alembic migrations, local user provisioning, and API-token authentication.
-Do not add project endpoints, uploads,
-workers, runners, or CI without a new milestone request.
+Milestones 1–4: local FastAPI/PostgreSQL infrastructure, users/projects models,
+explicit migrations, local user provisioning, API-token authentication, and
+authenticated project creation/retrieval. Do not add listing, editing, deletion,
+uploads, workers, runners, or CI without a new milestone request.
 Keep secrets and runtime data outside Git. Preserve unrelated work.
 
 # Verification

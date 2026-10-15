@@ -1,8 +1,8 @@
-# Lavan backend: milestones 1–3
+# Lavan backend: milestones 1–4
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
-and two Compose services. Opaque API-token authentication and /v1/me; no project endpoints.
+and two Compose services. Opaque API-token authentication, /v1/me, and project creation/retrieval.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -258,3 +258,46 @@ plus the existing Ruff checks. The new revision is `0002_api_tokens`, following
 `0001_users_projects`. Only disposable tests downgrade. Restore your prior API
 service state after manual verification, preserve volumes, and retain explicitly
 identified verification users/revoked tokens rather than deleting unrelated data.
+
+## Milestone 4: authenticated project creation and retrieval
+
+`POST /v1/projects` accepts only `{"name": "..."}`. Names are trimmed before
+validation and must contain 1–100 characters after trimming. Duplicate names are
+allowed. Extra fields (including id and owner_id), missing/non-string names, and
+invalid lengths return 422. Ownership always comes from the Bearer token.
+
+Successful creation returns 201 with a relative `Location: /v1/projects/<uuid>`
+header. Project responses contain exactly id, name, created_at, and updated_at.
+`GET /v1/projects/<uuid>` returns 200 only for the owner. Another user's project
+and a nonexistent UUID return the same 404 `{"detail":"Project not found"}`.
+Malformed UUIDs return 422 for authenticated callers. Both endpoints require
+valid, unrevoked tokens (otherwise sanitized 401 with WWW-Authenticate: Bearer).
+Database failures return sanitized 503. No listing/editing/deletion is available.
+
+Use the milestone-3 issuance instructions to hold API_TOKEN and TOKEN_ID in shell
+variables without placing a literal secret in history. Then:
+
+```bash
+docker compose up --build -d --wait --wait-timeout 120
+set +x
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --include --fail-with-body --max-time 5 \
+    --header 'Content-Type: application/json' \
+    --data '{"name":"  My project  "}' \
+    http://127.0.0.1:8000/v1/projects
+PROJECT_ID="<project-uuid-from-response>"
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --include --fail-with-body --max-time 5 \
+    "http://127.0.0.1:8000/v1/projects/$PROJECT_ID"
+uv run python -m lavan.manage revoke-token "$TOKEN_ID"
+unset API_TOKEN TOKEN_ID
+```
+
+Do not echo tokens or put them in URLs. For ownership verification, repeat the GET
+with a second user's token and expect the identical sanitized 404 response used
+for nonexistent projects. Revoke both verification tokens afterward. Retain
+explicitly identified local verification users/projects and restore the prior
+service state without deleting data or volumes.
+
+No schema or dependency change is required; head remains `0002_api_tokens`.
+Run `LAVAN_POSTGRES_TESTS=1 uv run pytest` and the existing Ruff/lock checks.

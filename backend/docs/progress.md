@@ -102,3 +102,47 @@ Docker info still fails in this agent session with socket permission denied;
 process groups are agent/sudo/users. Real PostgreSQL checks after the fix are
 NOT RUN and pending using README's bounded assertion commands. No services,
 volumes, or data were changed. Milestone 2 was not started.
+
+## Real PostgreSQL verification completed (2026-10-15)
+
+Overall result: PASS for the milestone-1 real runtime sequence on commit 90a200b.
+Approved outside-sandbox execution has Docker access (`agent sudo users docker`);
+the restricted sandbox drops supplementary groups. This explains the earlier
+agent Docker access failures, rather than a missing host group membership.
+
+Initial state: PostgreSQL running and healthy, API stopped. Built the current
+API using `docker compose up --build -d --wait --wait-timeout 120`; locked
+production dependency installation succeeded. Used the existing database volume
+and local configuration. The earlier healthy-database 503 did not reproduce:
+initial live 200 in 0.002759s, ready 200 in 1.141963s. No code change or timeout
+increase was justified. The exact cause of the earlier user-reported recovery
+failure remains unproven; successful SELECT 1 now establishes API-to-database
+connectivity and authentication with the existing configuration.
+
+Explicit HTTP status, exact sanitized JSON body, and <3-second duration assertions
+passed in the full sequence (seconds measured with a monotonic clock):
+
+| Scenario | Endpoint | Expected | Actual | Seconds |
+| --- | --- | --- | --- | --- |
+| Healthy database | live | 200 | 200 | 0.016552 |
+| Healthy database | ready | 200 | 200 | 1.008189 |
+| Outage 1 | live | 200 | 200 | 0.001870 |
+| Outage 1 | ready | 503 | 503 | 1.022716 |
+| Outage 2 | live | 200 | 200 | 0.002625 |
+| Outage 2 | ready | 503 | 503 | 0.967921 |
+| Outage 3 | live | 200 | 200 | 0.002032 |
+| Outage 3 | ready | 503 | 503 | 1.053794 |
+| Recovered database | ready | 200 | 200 | 1.039492 |
+| Recovered database | live | 200 | 200 | 0.001833 |
+
+Outage liveness requests ran while readiness requests were in flight. Only
+PostgreSQL was stopped for the outage. After its bounded health-check wait,
+readiness recovered without restarting or replacing the API: container ID,
+StartedAt, and RestartCount all remained unchanged. Recent API/PostgreSQL logs
+had no traceback, fatal, error, or warning entries; raw logs were not exposed.
+
+Finally restored the initial state: PostgreSQL running/healthy, API stopped
+(exit 0). No database volumes or data were deleted or reset. No application
+changes were necessary; prior automated test results remain as documented above
+and were not rerun for this documentation-only update. The previously pending
+real database verification is now complete. Milestone 2 was not started.

@@ -1,8 +1,8 @@
-# Lavan backend: milestones 1–4
+# Lavan backend: milestones 1–5
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
-and two Compose services. Opaque API-token authentication, /v1/me, and project creation/retrieval.
+and two Compose services. Opaque API-token authentication, projects, and private ZIP artifact metadata.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -299,5 +299,151 @@ for nonexistent projects. Revoke both verification tokens afterward. Retain
 explicitly identified local verification users/projects and restore the prior
 service state without deleting data or volumes.
 
-No schema or dependency change is required; head remains `0002_api_tokens`.
+Milestone 4 required no schema or dependency change; its head was
+`0002_api_tokens`. Milestone 5 below advances it to `0003_artifacts`.
 Run `LAVAN_POSTGRES_TESTS=1 uv run pytest` and the existing Ruff/lock checks.
+
+## Milestone 5: private ZIP artifacts
+
+Only these endpoints are added:
+- `POST /v1/projects/<project-uuid>/artifacts`, raw `application/zip` body.
+- `GET /v1/projects/<project-uuid>/artifacts/<artifact-uuid>`, metadata only.
+
+Both require a valid Bearer token and project ownership. Ownership is checked
+before reading the upload body, and that short database session closes before
+transfer. Metadata lookups also verify that the artifact belongs to the project.
+Missing, mismatched, and inaccessible resources return the same sanitized 404.
+No download/static route, extraction, decompression, installation, or execution
+exists. Responses expose only id, project_id, size_bytes, sha256, file_count,
+declared_uncompressed_bytes, created_at. Creation returns 201 and Location only
+after validation and metadata commit. file_count excludes directories; entry
+limits include directories. SHA-256 covers the complete uploaded ZIP bytes.
+
+Apply the explicit migration to head using the existing migration instructions
+(`0003_artifacts`). Do not downgrade development. With API_TOKEN held securely as
+in milestone 3, PROJECT_ID set to an owned project's UUID, and a local ZIP file:
+
+```bash
+set +x
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --include --fail-with-body --max-time 70 \
+    --header 'Content-Type: application/zip' --data-binary @/path/to/archive.zip \
+    "http://127.0.0.1:8000/v1/projects/$PROJECT_ID/artifacts"
+ARTIFACT_ID="<artifact-uuid-from-response>"
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --fail-with-body --max-time 5 \
+    "http://127.0.0.1:8000/v1/projects/$PROJECT_ID/artifacts/$ARTIFACT_ID"
+# Revoke verification tokens afterward using their TOKEN_ID; never print secrets.
+```
+
+HTTP responses: 401 invalid credentials; 404 resource unavailable; 415 unsupported
+Content-Type; 413 actual received bytes exceed compressed limit; 422 invalid,
+empty, unsafe, or unsupported ZIP; 408 upload deadline; 400 interrupted upload
+(if the client can still receive a response); 503 capacity/storage/database
+unavailable. Client filenames, storage keys/paths, and internal errors are never
+returned. Content-Length is not trusted. Requests are processed in at most
+64-KiB write/hash chunks; no multipart parser or full-body buffering is used.
+
+### Limits and private storage
+
+Environment settings (bytes unless stated); Compose forwards all limit settings
+from `.env` using the same defaults:
+
+| Setting | Default |
+| --- | --- |
+| ZIP_MAX_COMPRESSED_BYTES | 52428800 (50 MiB) |
+| ZIP_MAX_UNCOMPRESSED_BYTES | 209715200 (200 MiB declared total) |
+| ZIP_MAX_ENTRIES | 2000 (files plus directories) |
+| ZIP_MAX_FILE_BYTES | 52428800 (50 MiB declared per file) |
+| ZIP_MAX_FILENAME_CHARS | 512 decoded characters |
+| UPLOAD_MAX_SECONDS | 60 |
+| UPLOAD_MAX_ACTIVE | 2 per API process |
+
+The deadline starts when an upload acquires capacity and bounds receiving the
+body, with checks around bounded filesystem/validation work. Interrupted or
+cancelled blocking work is drained before cleanup, never left in the background;
+filesystem/kernel stalls and final database commit/cleanup can extend wall time.
+One capacity slot is held through validation and persistence. Excess concurrent
+uploads return 503 instead of waiting. These are **per-process** limits: multiple
+workers/containers multiply concurrency and require a future coordinated/global
+limit if deployed that way. Validation is also limited by these same slots.
+
+Compose persists files in `lavan-local_artifact_data`, mounted privately at
+`/var/lib/lavan/artifacts`, owned by the non-root API user. Host execution defaults
+to `~/.local/share/lavan/artifacts`; ARTIFACT_STORAGE_DIR can select another
+absolute dedicated directory outside the source repository. Do not use a source
+bind mount. Directories use mode 0700 and files 0600. Do not manually change volume
+ownership or publish it through a web server. Normal compose stop/down preserves
+both volumes; down --volumes deletes data and must not be used for verification.
+
+Uploads stage into server-generated `.UUID.part` files. After validation and
+fsync, an atomic same-filesystem hard-link publishes UUID.zip without overwriting
+an existing file; the temporary link is removed. Metadata then commits. Rejected,
+oversize, interrupted, timed-out, and ordinary failed uploads clean their files.
+Known metadata rollback removes the newly published file. A lost COMMIT
+acknowledgement is checked using a fresh session: a referenced file is preserved;
+if the database is unreachable, the file is conservatively retained for later
+reconciliation rather than risking deletion of referenced data. Such an uncertain
+request may return 503 even though the metadata transaction committed.
+
+### ZIP metadata policy and limitations
+
+Only ordinary single-disk, non-ZIP64 ZIPs using STORED or DEFLATED are supported.
+Central and local header metadata, declared byte ranges, and optional data
+descriptors must agree; truncated, overlapping, prefixed/self-extracting, gapped,
+trailing-data, encrypted, or unsupported layouts are rejected. Parsing checks the
+entry count and record/name bounds while scanning rather than first building an
+unbounded directory list. Payload bytes are never inflated or read to verify CRC.
+
+Original raw filename bytes are inspected before library filename truncation can
+hide NULs, then decoded using UTF-8 when flagged, otherwise CP437. Names are POSIX
+relative paths. NFC-normalized paths are compared case-sensitively for duplicates.
+Backslashes, NUL/control/format characters, absolute/UNC/drive paths, empty, dot or
+dot-dot components, repeated slashes, Windows-reserved names/punctuation, and
+components ending in dots/spaces are rejected. A single terminal slash denotes a
+directory. Explicit duplicate directories, file/directory conflicts (including
+implied parent directories), symlinks and special-file modes are rejected. Nested
+regular files and ordinary directories are accepted; at least one file is required.
+
+This is **preliminary metadata validation**, not proof of payload integrity or
+sandbox safety. A future runner must independently enforce actual decompressed
+byte counts, safe extraction containment, CRC/integrity, resource limits, and safe
+handling of filenames/permissions on its target filesystem. This milestone does
+not perform any of those future execution steps.
+
+### Conservative local reconciliation
+
+Filesystem publication and PostgreSQL commit are not a single transaction. A
+crash before publication can leave a .part file; a crash after publication but
+before commit can leave an unreferenced .zip (or both hard links). A committed
+row/file may exist even if the client never received its response. Keep storage
+and database backups consistent. Reconciliation does not repair missing referenced
+files or prove payload integrity.
+
+Use the SAME database and storage configuration as the API. Host and Compose
+storage roots differ; use Compose for its volume. Ensure PostgreSQL is running
+(`docker compose up -d --wait --wait-timeout 60 postgres`) before reconciliation:
+
+```bash
+# Default: dry-run, default minimum age 86400 seconds (one day).
+docker compose run --rm --no-deps -T api /app/.venv/bin/python -m lavan.reconcile
+# Explicit deletion after reviewing dry-run; hard minimum age is 3600 seconds.
+docker compose run --rm --no-deps -T api /app/.venv/bin/python -m lavan.reconcile \
+  --delete --min-age-seconds 86400
+# Host alternative, only for the host API's configured storage root/database:
+uv run python -m lavan.reconcile
+```
+
+The command holds an exclusive storage-wide advisory lock from metadata snapshot
+through deletion. Uploads hold a shared lock through commit and cleanup. If any
+upload is active, reconciliation refuses without deleting anything; if reconciliation
+holds the lock, new uploads fail safely with 503. This works across cooperating
+processes sharing the same volume and lock file. Dry-run never changes archive
+files; it may initialize the reserved coordination lock file. Missing roots return
+an empty result. Only recognized UUID .zip/.part regular files contained within
+the verified root are eligible. Referenced, recent, unknown, symlink, and active
+files are preserved. No recursive deletion or database modification occurs. Never
+point this command at an unrelated directory or remove the lock file manually.
+
+`LAVAN_POSTGRES_TESTS=1 uv run pytest` uses disposable databases and isolated
+pytest storage. No test uploads or real tokens are committed to Git.

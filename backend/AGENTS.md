@@ -1,8 +1,9 @@
 # Scope
-Milestones 1–4: local FastAPI/PostgreSQL infrastructure, users/projects models,
+Milestones 1–5: local FastAPI/PostgreSQL infrastructure, users/projects models,
 explicit migrations, local user provisioning, API-token authentication, and
-authenticated project creation/retrieval. Do not add listing, editing, deletion,
-uploads, workers, runners, or CI without a new milestone request.
+authenticated projects and private ZIP artifact upload/metadata validation.
+Never extract/decompress uploaded payloads. Do not add listing, editing, deletion,
+downloads, execution, workers, runners, or CI without a new milestone request.
 Keep secrets and runtime data outside Git. Preserve unrelated work.
 
 # Verification

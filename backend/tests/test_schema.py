@@ -26,6 +26,7 @@ def test_initial_upgrade_and_idempotence(migrated):
             "projects",
             "alembic_version",
             "api_tokens",
+            "artifacts",
         }
         assert inspector.get_pk_constraint("users")["name"] == "pk_users"
         assert inspector.get_pk_constraint("projects")["name"] == "pk_projects"
@@ -57,7 +58,7 @@ def test_initial_upgrade_and_idempotence(migrated):
             (c["name"], str(c["type"]), c["default"]) for c in after
         ]
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0002_api_tokens"
+            "0003_artifacts"
         )
 
 

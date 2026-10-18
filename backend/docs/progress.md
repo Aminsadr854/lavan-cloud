@@ -307,3 +307,92 @@ and unrelated records were preserved. Disposable test databases were removed.
 Initial/final service state: PostgreSQL running/healthy, API stopped (exit 0).
 No checks are blocked. Next milestone: private ZIP artifact upload and validation.
 It has not been started.
+
+## Milestone 5 completed (2026-10-18)
+
+Added private raw application/zip upload and authenticated artifact metadata:
+POST /v1/projects/{project_id}/artifacts and
+GET /v1/projects/{project_id}/artifacts/{artifact_id}. Ownership is checked before
+body consumption in a short session closed before transfer; it is rechecked
+before persistence. All inaccessible/missing/mismatched artifact resources return
+sanitized 404. Metadata exposes only the seven documented public fields.
+
+Actual bytes are counted and SHA-256 hashed during streaming, independent of
+Content-Length. Writes/hash operations use <=64-KiB pieces. Upload/validation
+capacity is bounded per process (default 2), with a 60-second receive/processing
+budget and cancellation-safe draining of blocking work before cleanup. Blocking
+work runs off the event loop. Filesystem stalls/final commit/cleanup can extend
+wall time; this is not a hard kernel-I/O deadline. No DB session/transaction is
+held during body transfer. Staging files and archive files use 0600 in 0700
+private storage outside the source tree; Compose adds lavan-local_artifact_data.
+Atomic same-filesystem hard-link publication precedes DB commit. Ordinary failed
+uploads roll back/clean up; uncertain commit acknowledgement preserves potentially
+referenced files and may require later reconciliation. See README for crash windows.
+
+Added Artifact model and migration 0003_artifacts after unchanged 0002_api_tokens:
+UUID identifiers, indexed project FK with RESTRICT, unique private storage key,
+nonnegative counts, SHA-256, and UTC timestamp. No extraction, decompression,
+installation, execution, download, queue, runner, or public URL was introduced.
+The ZIP parser validates bounded central/local directory structures and original
+filenames, permitted methods, modes, sizes, normalized paths/conflicts and optional
+data descriptors. ZIP64/multi-disk/prefixed and other unsupported layouts fail
+closed. This does NOT prove CRC/payload integrity or safe future extraction.
+
+Added conservative `python -m lavan.reconcile`: dry-run default, explicit --delete,
+minimum age >=3600s (default 86400), verified root containment, only recognized
+regular UUID files, no symlink/unknown/referenced/recent removal. Shared upload
+locks and exclusive reconciliation lock prevent deletion racing with active
+uploads; reconciliation refuses while uploads are active. No global pruning.
+
+Verification:
+- `LAVAN_POSTGRES_TESTS=1 uv run pytest`: 128 passed, zero failed/skipped.
+  Includes 65 existing tests and 63 artifact/storage tests using real PostgreSQL
+  disposable databases and isolated pytest storage. Covers valid nested files,
+  matching stored bytes/hash, MIME/auth/ownership/mismatch, missing/misleading
+  Content-Length, invalid/truncated/encrypted/unsupported archives, original NUL
+  names, paths, symlinks/special files, duplicates/conflicts, all configured limits,
+  timeouts/disconnect/cancellation, capacity, no abandoned validation, DB rollback
+  compensation, uncertain commit acknowledgement, reconciliation safety, project
+  deletion restriction, nonnegative constraints and migration downgrade/re-upgrade.
+- Metadata comparison, Ruff lint/format and locked installation passed. No new
+  dependencies were required. Existing upstream HTTPX TestClient warning remains.
+- Docker build passed on retry after a transient ghcr.io TLS handshake timeout.
+  Quiet Compose validation passed; exactly two services remain.
+- Confirmed local lavan_dev at 0002_api_tokens with no artifacts table conflict,
+  then applied upgrade head only. Current/head are 0003_artifacts; Alembic check
+  reports no pending operations. No old migration was edited.
+
+Actual HTTP verification against PostgreSQL:
+
+| Scenario | HTTP | Seconds |
+| --- | --- | --- |
+| Create verification project | 201 | 0.114896 |
+| Upload generated valid ZIP | 201 | 0.034904 |
+| Retrieve owned metadata | 200 | 0.019145 |
+| Another user requests metadata | 404 | 0.010699 |
+| Reject invalid ZIP | 422 | 0.017859 |
+| Unauthenticated metadata | 401 | 0.002320 |
+| Liveness | 200 | 0.001262 |
+| Readiness | 200 | 1.166832 |
+
+Asserted checksum/byte count, metadata equality, Location, ownership, sanitized
+errors, and health bodies. A read-only private-storage inspection confirmed stored
+bytes/hash, 0600 mode and no rejected-upload staging leftovers. Development-volume
+reconciliation dry-run returned an empty candidate list and deleted nothing.
+Raw tokens were captured only in memory, never printed or written to a file.
+
+Retained local verification records and successful private artifact:
+- User A: adb63c97-05fb-4091-9347-844aa48e9b04
+- User B: 0d08ea83-0b1d-4052-a0c6-aa3c62c12c51
+- Project: 1ef74813-64bd-42e7-8f84-d290c1920bd0
+- Artifact: 70b2feef-0239-4180-87a5-c1eff0762bcf
+- Revoked A token ID: 7faf3fd2-c862-44e7-bf94-868cf87e40ad
+- Revoked B token ID: fcec29ad-bc8e-4c56-9797-b38db190c90a
+
+Initial inspection found BOTH services stopped (different from the prior report).
+Both were started temporarily; both are now stopped again, matching initial state.
+Verification tokens were revoked in finally cleanup. Existing development data,
+volumes and unrelated records were preserved. No development downgrade/reset/stamp
+or volume deletion occurred. No checks remain blocked.
+
+Next milestone: run lifecycle with a simulated runner. It has not been started.

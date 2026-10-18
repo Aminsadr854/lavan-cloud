@@ -3,6 +3,14 @@ services:
   api:
     build: .
     environment:
+      ARTIFACT_STORAGE_DIR: /var/lib/lavan/artifacts
+      ZIP_MAX_COMPRESSED_BYTES: ${ZIP_MAX_COMPRESSED_BYTES:-52428800}
+      ZIP_MAX_UNCOMPRESSED_BYTES: ${ZIP_MAX_UNCOMPRESSED_BYTES:-209715200}
+      ZIP_MAX_ENTRIES: ${ZIP_MAX_ENTRIES:-2000}
+      ZIP_MAX_FILE_BYTES: ${ZIP_MAX_FILE_BYTES:-52428800}
+      ZIP_MAX_FILENAME_CHARS: ${ZIP_MAX_FILENAME_CHARS:-512}
+      UPLOAD_MAX_SECONDS: ${UPLOAD_MAX_SECONDS:-60}
+      UPLOAD_MAX_ACTIVE: ${UPLOAD_MAX_ACTIVE:-2}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
@@ -10,6 +18,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - artifact_data:/var/lib/lavan/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -31,3 +41,4 @@ services:
       start_period: 5s
 volumes:
   postgres_data:
+  artifact_data:

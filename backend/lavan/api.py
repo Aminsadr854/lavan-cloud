@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from lavan.artifacts import router as artifacts_router
 from lavan.auth import authenticated_user
 from lavan.config import Settings
 from lavan.db import database_engine
@@ -51,7 +52,8 @@ class UserResponse(BaseModel):
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        Settings()  # Validate required configuration at startup.
+        app.state.settings = Settings()  # Validate configuration at startup.
+        app.state.active_uploads = 0
         app.state.probe_lock = asyncio.Lock()
         app.state.auth_engine = database_engine()
         try:
@@ -61,6 +63,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(lifespan=lifespan)
     app.include_router(projects_router)
+    app.include_router(artifacts_router)
 
     @app.get("/health/live")
     async def live():

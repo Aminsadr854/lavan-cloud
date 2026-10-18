@@ -1,6 +1,10 @@
-from pydantic import Field, SecretStr
+from pathlib import Path
+
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
+
+from lavan.storage import storage_root
 
 
 class Settings(BaseSettings):
@@ -13,6 +17,22 @@ class Settings(BaseSettings):
     postgres_db: str = Field(min_length=1)
     postgres_user: str = Field(min_length=1)
     postgres_password: SecretStr = Field(min_length=1)
+
+    artifact_storage_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".local/share/lavan/artifacts"
+    )
+    zip_max_compressed_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    zip_max_uncompressed_bytes: int = Field(default=200 * 1024 * 1024, ge=1)
+    zip_max_entries: int = Field(default=2000, ge=1, le=65534)
+    zip_max_file_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    zip_max_filename_chars: int = Field(default=512, ge=1)
+    upload_max_seconds: float = Field(default=60, gt=0)
+    upload_max_active: int = Field(default=2, ge=1)
+
+    @field_validator("artifact_storage_dir")
+    @classmethod
+    def private_storage_directory(cls, value):
+        return storage_root(value)
 
     @property
     def database_url(self) -> URL:

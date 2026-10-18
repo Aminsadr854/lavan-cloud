@@ -49,3 +49,15 @@ this initial policy. No default accounts/tokens, identity fields, or cascades ex
 Revision `0002_api_tokens` adds only api_tokens and its indexes. Its downgrade
 removes only that table, preserving users/projects, and is tested only in the
 fixture-created disposable databases. `0001_users_projects` is unchanged.
+
+## Private artifacts (milestone 5)
+
+`artifacts`: UUID id; non-null indexed UUID project_id referencing projects with
+ON DELETE RESTRICT; unique private storage_key (varchar(64)); nonnegative bigint
+size_bytes, file_count, declared_uncompressed_bytes; SHA-256 hex sha256
+(varchar(64)); and timezone-aware created_at with database now() default.
+Constraint names follow the existing pk/fk/uq/ix/ck convention. There are no file
+cascades: projects with artifacts cannot be deleted, and metadata deletion is not
+exposed. Storage keys are server-generated UUID filenames, never API fields.
+Revision 0003_artifacts follows unchanged 0002_api_tokens. Downgrades are tested
+only in disposable databases and do not delete files. No existing migration changed.

@@ -16,6 +16,7 @@ from lavan.config import Settings
 from lavan.db import database_engine
 from lavan.models import User
 from lavan.projects import router as projects_router
+from lavan.runs import router as runs_router
 
 READINESS_TIMEOUT = 2.0
 PROBE_COMMAND = (sys.executable, "-m", "lavan.probe")
@@ -64,6 +65,7 @@ def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.include_router(projects_router)
     app.include_router(artifacts_router)
+    app.include_router(runs_router)
 
     @app.get("/health/live")
     async def live():

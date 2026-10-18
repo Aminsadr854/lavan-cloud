@@ -8,8 +8,10 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     MetaData,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -76,7 +78,7 @@ class Artifact(Base):
     __table_args__ = tuple(
         CheckConstraint(f"{column} >= 0", name=f"{column}_nonnegative")
         for column in ("size_bytes", "file_count", "declared_uncompressed_bytes")
-    )
+    ) + (UniqueConstraint("id", "project_id", name="uq_artifacts_id_project_id"),)
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     project_id: Mapped[UUID] = mapped_column(
@@ -87,6 +89,35 @@ class Artifact(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     file_count: Mapped[int] = mapped_column(BigInteger)
     declared_uncompressed_bytes: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Run(Base):
+    __tablename__ = "runs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["artifact_id", "project_id"],
+            ["artifacts.id", "artifacts.project_id"],
+            name="fk_runs_artifact_project",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("status = 'queued'", name="status_queued"),
+        CheckConstraint(
+            "runtime_template = 'python-fastapi-v1'", name="runtime_template_supported"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), index=True
+    )
+    artifact_id: Mapped[UUID] = mapped_column()
+    status: Mapped[str] = mapped_column(
+        String(16), default="queued", server_default="queued"
+    )
+    runtime_template: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

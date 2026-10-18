@@ -396,3 +396,81 @@ volumes and unrelated records were preserved. No development downgrade/reset/sta
 or volume deletion occurred. No checks remain blocked.
 
 Next milestone: run lifecycle with a simulated runner. It has not been started.
+
+## Milestone 6A completed (2026-10-18)
+
+Added Run persistence and exactly POST /v1/projects/{project_id}/runs and
+GET /v1/projects/{project_id}/runs/{run_id}. Both reuse Bearer authentication and
+short, scoped synchronous sessions off the event loop. Queries filter ownership
+through Project. POST validates that the selected artifact is in that same owned
+project, forbids unknown fields, and accepts only explicit python-fastapi-v1.
+Creation commits before returning 201 and Location. Responses expose only id,
+project_id, artifact_id, status, runtime_template, created_at. Resource absence,
+mismatched project/artifact/run IDs, and other-owner access use sanitized 404;
+invalid UUIDs/body/template use 422, credentials 401, database failures 503.
+
+Run contains only the six specified columns: application UUID, direct indexed
+project FK, artifact FK via the composite (artifact_id, project_id) relation,
+queued-only status/default, supported-template constraint, UTC created_at default.
+New uq_artifacts_id_project_id is required by PostgreSQL as the explicit unique
+target for that composite FK, despite globally unique artifact IDs. Both run FKs
+use RESTRICT; no cascade deletion or duplicate user_id exists.
+
+Every request remains queued. There is no dispatch, worker, job queue, simulated
+runner, background lifecycle task, execution, source inspection, cancellation,
+expiration, log streaming, run listing or active-run quota. Explicit template
+selection is not compatibility validation. Idempotency is deferred; repeated POSTs
+create independent records and clients must not blindly retry uncertain requests.
+
+Verified:
+- LAVAN_POSTGRES_TESTS=1 uv run pytest: 164 passed, zero failed/skipped.
+  Includes 36 new real PostgreSQL run tests plus all 128 previous tests. Verified
+  response/Location/persistence, owner-only retrieval, same-owner cross-project
+  artifact rejection, direct DB consistency/status/template/delete constraints,
+  identical missing/inaccessible 404s, malformed UUID/body/unknown fields,
+  missing/unknown/revoked credentials for both endpoints, repeated submissions,
+  off-loop I/O, cleanup/rollback, disposable-only downgrade/re-upgrade preserving
+  artifacts, and clean metadata comparison. Existing HTTPX warning remains.
+- Ruff lint/format, uv sync --locked, Docker build and quiet Compose validation
+  passed. No dependency changes were required.
+- Confirmed local Compose lavan_dev at 0003_artifacts with no runs table before
+  applying only upgrade head. Current/heads now report 0004_runs; Alembic check
+  reports no pending changes. Both restrictive run FKs were inspected. Existing
+  counts (5 users, 2 projects, 1 artifact, 5 tokens) were unchanged by migration
+  before explicitly adding the new smoke-test records. No old migration edited.
+
+Actual HTTP smoke test:
+
+| Check | HTTP | Seconds |
+| --- | --- | --- |
+| Create verification project | 201 | 0.095488 |
+| Upload inert ZIP | 201 | 0.033274 |
+| Create queued run | 201 | 0.030373 |
+| Retrieve owned queued run | 200 | 0.012006 |
+| Another user retrieves run | 404 | 0.014398 |
+| Another user submits run | 404 | 0.010940 |
+| Unauthenticated run retrieval | 401 | 0.002330 |
+| Liveness | 200 | 0.006689 |
+| Readiness | 200 | 1.087306 |
+
+Asserted exact response fields, IDs, queued status, explicit runtime template,
+Location, owner retrieval equality, sanitized cross-user errors, and health bodies.
+The ZIP contained an inert text fixture; nothing inspected/executed it as an app.
+Tokens stayed only in memory and were never printed or written to tracked files.
+Retained explicitly identified local verification records:
+- User A: 3cda3d8f-c491-4690-942d-1eb0bfdf4b74
+- User B: 41b37b98-dd2a-4dd0-80d7-08649019a36b
+- Project: 990646cf-ad47-4b98-a7e6-f611ced35a6e
+- Artifact (private file retained): 68efbac4-477e-4aaa-84ff-bf347835cd9d
+- Queued run: cb469352-2edd-46c4-868e-a514fad336e2
+- Revoked A token ID: 226390f9-293d-4fb8-a16f-f201ff71a703
+- Revoked B token ID: f168f80c-3828-410e-aeb7-0162ec7e5bee
+
+Finally cleanup revoked both verification tokens and restored both services to
+stopped (initial state). Existing development data, private artifact files, and
+both volumes were preserved. No development downgrade/reset/stamp or unrelated
+record deletion occurred. All automated destructive checks used newly created
+UUID-named disposable databases. No checks remain blocked.
+
+Next milestone: idempotency and lifecycle processing with a simulated runner.
+Milestone 6B/lifecycle processing has not started.

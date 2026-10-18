@@ -1,4 +1,4 @@
-# Database schema (milestones 2–3)
+# Database schema (milestones 2–6A)
 
 `users`: application-generated UUID primary key and non-null `created_at`
 (`timestamptz`, database `now()` default). There are no identity or auth fields.
@@ -61,3 +61,26 @@ cascades: projects with artifacts cannot be deleted, and metadata deletion is no
 exposed. Storage keys are server-generated UUID filenames, never API fields.
 Revision 0003_artifacts follows unchanged 0002_api_tokens. Downgrades are tested
 only in disposable databases and do not delete files. No existing migration changed.
+
+## Queued execution requests (milestone 6A)
+
+`runs`: application-generated UUID id; non-null indexed project_id FK directly
+to projects.id; non-null artifact_id; status varchar(16), default queued and
+constrained to queued; runtime_template varchar(32), constrained to
+python-fastapi-v1 with no implicit template default; created_at timestamptz with
+database now() default. There is no user_id: ownership is derived through projects.
+
+`fk_runs_artifact_project` maps (artifact_id, project_id) to
+artifacts.(id, project_id), enforcing consistency even for direct database writes.
+The new `uq_artifacts_id_project_id` is logically redundant with the global
+artifact PK, but PostgreSQL requires an explicit matching unique target for that
+composite FK. It is added only in new revision 0004_runs after 0003_artifacts.
+Both the direct project FK and composite artifact FK use ON DELETE RESTRICT.
+No metadata/files are cascade-deleted. The downgrade removes runs and the new
+pair constraint, preserving artifacts/projects; only disposable tests run it.
+
+All records stay queued; no lifecycle processing exists. The runtime template is
+an explicit client selection, not source-compatibility validation. Repeated POSTs
+produce independent records: no quotas or idempotency keys are implemented yet.
+Future milestones must explicitly migrate the status constraint/schema before
+adding lifecycle transitions; no speculative lifecycle columns are present here.

@@ -1,8 +1,9 @@
-# Lavan backend: milestones 1–5
+# Lavan backend: milestones 1–6A
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
-and two Compose services. Opaque API-token authentication, projects, and private ZIP artifact metadata.
+and two Compose services. Opaque API-token authentication, projects, private ZIP artifacts, and queued
+execution-request persistence. No execution is dispatched.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -447,3 +448,60 @@ point this command at an unrelated directory or remove the lock file manually.
 
 `LAVAN_POSTGRES_TESTS=1 uv run pytest` uses disposable databases and isolated
 pytest storage. No test uploads or real tokens are committed to Git.
+
+## Milestone 6A: persisted execution requests (queued only)
+
+`POST /v1/projects/<project-uuid>/runs` accepts exactly:
+
+```json
+{"artifact_id":"<artifact-uuid>","runtime_template":"python-fastapi-v1"}
+```
+
+Use an artifact from that same owned project. The selected runtime template is
+explicit, **not proof that the uploaded source is a compatible FastAPI app**.
+No source is read, inspected, extracted, installed, or executed to check it.
+Only python-fastapi-v1 is accepted. Status, owner_id, resource limits, and all
+other fields are rejected. Malformed UUIDs/missing fields/invalid templates return
+422. Invalid credentials return 401. Inaccessible/missing projects and missing or
+mismatched artifacts all return the same sanitized 404 `{"detail":"Not found"}`.
+
+Successful creation returns **201**, not 202: it creates a resource without any
+asynchronous dispatch. Location is `/v1/projects/<project-uuid>/runs/<run-uuid>`.
+`GET` of that URL returns the owned run, with fields id, project_id, artifact_id,
+status, runtime_template, created_at. Missing runs, URL/project mismatches, and
+other-owner access return the same sanitized 404. No filesystem paths, storage
+keys, source, or user ownership details are returned.
+
+After explicit `alembic upgrade head` using the existing WSL or Compose commands,
+head is `0004_runs`. With an API_TOKEN held securely as described in milestone 3:
+
+```bash
+PROJECT_ID="<owned-project-uuid>"
+ARTIFACT_ID="<artifact-uuid-in-that-project>"
+set +x
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --include --fail-with-body --max-time 5 \
+    --header 'Content-Type: application/json' \
+    --data "{\"artifact_id\":\"$ARTIFACT_ID\",\"runtime_template\":\"python-fastapi-v1\"}" \
+    "http://127.0.0.1:8000/v1/projects/$PROJECT_ID/runs"
+RUN_ID="<run-uuid-from-response>"
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --fail-with-body --max-time 5 \
+    "http://127.0.0.1:8000/v1/projects/$PROJECT_ID/runs/$RUN_ID"
+# Revoke verification tokens afterward using their TOKEN_ID, then unset secrets.
+```
+
+**Every run remains queued indefinitely in this milestone. Nothing executes
+these requests automatically.** There is no worker, background task, queue,
+cancellation, expiration processing, logging stream, listing, or active-run quota.
+Idempotency keys are not implemented; repeated POSTs create separate records.
+Clients must not blindly retry an uncertain submission (for example, a timeout
+may occur after commit). Idempotency-Key headers do not deduplicate requests yet.
+
+The database also enforces artifact/project consistency via a composite FK and
+rejects deletion of referenced artifacts/projects without cascades. Status and
+template constraints allow only the values above; later migrations will extend
+them as lifecycle processing is introduced. Real PostgreSQL tests include direct
+constraint violations and disposable-only downgrade/re-upgrade checks. Restore
+service state after verification and preserve all development volumes/records.
+Next milestone: idempotency and lifecycle processing with a simulated runner.

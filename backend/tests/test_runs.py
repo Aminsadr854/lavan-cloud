@@ -21,7 +21,10 @@ class Harness:
         return "<private run test harness>"
 
     def headers(self, index=0):
-        return {"Authorization": "Bearer " + self.tokens[index]}
+        return {
+            "Authorization": "Bearer " + self.tokens[index],
+            "Idempotency-Key": uuid4().hex,
+        }
 
     def create(self, project=None, artifact=None, headers=None, payload=None):
         return self.client.post(
@@ -32,7 +35,9 @@ class Harness:
                 "artifact_id": str(artifact or self.artifacts[0]),
                 "runtime_template": "python-fastapi-v1",
             },
-            headers=self.headers() if headers is None else headers,
+            headers=self.headers()
+            if headers is None
+            else {"Idempotency-Key": uuid4().hex, **headers},
         )
 
     def count(self):
@@ -361,3 +366,319 @@ def test_migration_downgrade_preserves_artifacts_then_reupgrade(h, migrated):
         assert "uq_artifacts_id_project_id" in {
             u["name"] for u in inspect(c).get_unique_constraints("artifacts")
         }
+
+
+def test_idempotent_replay_canonical_json_and_conflict(h):
+    headers = h.headers()
+    first = h.create(headers=headers)
+    replay = h.client.post(
+        f"/v1/projects/{h.projects[0]}/runs",
+        headers={**headers, "Content-Type": "application/json"},
+        content=' { "runtime_template": "python-fastapi-v1", "artifact_id": "'
+        + str(h.artifacts[0]).upper()
+        + '" } ',
+    )
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    assert first.headers["location"] == replay.headers["location"]
+    assert h.count() == h.before + 1
+    assert (
+        h.create(
+            project=h.projects[1], artifact=h.artifacts[1], headers=headers
+        ).status_code
+        == 409
+    )
+    assert h.create(artifact=h.artifacts[1], headers=headers).status_code == 404
+    assert (
+        h.create(
+            project=h.projects[2], artifact=h.artifacts[2], headers=headers
+        ).status_code
+        == 404
+    )
+    from lavan.models import RunIdempotency
+
+    with Session(h.engine) as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunIdempotency)
+                .where(RunIdempotency.run_id == UUID(first.json()["id"]))
+            )
+            == 1
+        )
+
+
+@pytest.mark.parametrize(
+    "key", [None, "", "a" * 129, "with space", "a,b", "a/b", "a\t", "\xe9"]
+)
+def test_invalid_or_missing_key_is_sanitized(h, key):
+    headers = [(b"authorization", ("Bearer " + h.tokens[0]).encode())]
+    if key is not None:
+        headers.append((b"idempotency-key", key.encode("latin1")))
+    response = h.client.post(
+        f"/v1/projects/{h.projects[0]}/runs",
+        headers=headers,
+        json={
+            "artifact_id": str(h.artifacts[0]),
+            "runtime_template": "python-fastapi-v1",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid Idempotency-Key"}
+    assert h.count() == h.before
+
+
+def test_duplicate_key_headers_rejected(h):
+    response = h.client.post(
+        f"/v1/projects/{h.projects[0]}/runs",
+        headers=[*h.headers().items(), ("Idempotency-Key", uuid4().hex)],
+        json={
+            "artifact_id": str(h.artifacts[0]),
+            "runtime_template": "python-fastapi-v1",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid Idempotency-Key"}
+
+
+def test_key_scope_users_case_and_revocation(h):
+    headers = h.headers()
+    headers["Idempotency-Key"] = "A" + uuid4().hex
+    first = h.create(headers=headers)
+    assert first.status_code == 201
+    assert (
+        h.create(
+            headers={**headers, "Idempotency-Key": headers["Idempotency-Key"].lower()}
+        ).json()["id"]
+        != first.json()["id"]
+    )
+    assert (
+        h.create(
+            project=h.projects[2],
+            artifact=h.artifacts[2],
+            headers={**h.headers(1), "Idempotency-Key": headers["Idempotency-Key"]},
+        ).status_code
+        == 201
+    )
+    with Session(h.engine) as session:
+        token = session.scalar(
+            select(ApiToken).where(ApiToken.digest == token_digest(h.tokens[0]))
+        )
+        token.revoked_at = utc_now()
+        session.commit()
+    assert h.create(headers=headers).status_code == 401
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_concurrent_scoped_keys_separate_connections(h, monkeypatch, conflicting):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    from sqlalchemy import text
+
+    from lavan.models import RunIdempotency
+
+    barrier = Barrier(2, timeout=10)
+    pids = []
+    lock = Lock()
+
+    class SynchronizedSession(Session):
+        def execute(self, statement, *args, **kwargs):
+            if (
+                getattr(statement, "is_insert", False)
+                and statement.table.name == "run_idempotency"
+            ):
+                pid = self.connection().scalar(text("SELECT pg_backend_pid()"))
+                with lock:
+                    pids.append(pid)
+                barrier.wait()
+            return super().execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(auth, "Session", SynchronizedSession)
+    headers = h.headers()
+
+    def submit(index):
+        project_index = index if conflicting else 0
+        return h.create(
+            project=h.projects[project_index],
+            artifact=h.artifacts[project_index],
+            headers=headers,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(submit, range(2)))
+    assert len(set(pids)) == 2
+    assert sorted(r.status_code for r in responses) == (
+        [201, 409] if conflicting else [201, 201]
+    )
+    successful = [r for r in responses if r.status_code == 201]
+    assert len({r.json()["id"] for r in successful}) == 1
+    assert len({r.headers["location"] for r in successful}) == 1
+    assert h.count() == h.before + 1
+    with Session(h.engine) as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunIdempotency)
+                .where(RunIdempotency.key == headers["Idempotency-Key"])
+            )
+            == 1
+        )
+
+
+def test_atomic_failure_leaves_neither_record(h, monkeypatch):
+    from lavan.models import RunIdempotency
+
+    class FailingSession(Session):
+        def commit(self):
+            self.flush()
+            raise OperationalError("private", {}, Exception("private"))
+
+    monkeypatch.setattr(auth, "Session", FailingSession)
+    headers = h.headers()
+    assert h.create(headers=headers).status_code == 503
+    assert h.count() == h.before
+    with Session(h.engine) as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RunIdempotency)
+                .where(RunIdempotency.key == headers["Idempotency-Key"])
+            )
+            == 0
+        )
+
+
+def test_upgrade_existing_runs_and_downgrade_only_disposable(h, migrated):
+    from lavan.models import RunIdempotency
+
+    engine, name = migrated
+    migration(engine, name, command.downgrade, "0004_runs")
+    with Session(engine) as session:
+        run = Run(
+            project_id=h.projects[0],
+            artifact_id=h.artifacts[0],
+            runtime_template="python-fastapi-v1",
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+    migration(engine, name, command.upgrade, "head")
+    response = h.client.get(
+        f"/v1/projects/{h.projects[0]}/runs/{run_id}", headers=h.headers()
+    )
+    assert response.status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(RunIdempotency)) == 0
+    migration(engine, name, command.downgrade, "0004_runs")
+    with Session(engine) as session:
+        assert session.get(Run, run_id) is not None
+        assert "run_idempotency" not in inspect(session.connection()).get_table_names()
+    migration(engine, name, command.upgrade, "head")
+
+
+def test_same_project_different_artifact_conflicts_after_authorization(h):
+    with Session(h.engine) as session:
+        artifact = Artifact(
+            project_id=h.projects[0],
+            storage_key=uuid4().hex,
+            size_bytes=0,
+            sha256="0" * 64,
+            file_count=1,
+            declared_uncompressed_bytes=0,
+        )
+        session.add(artifact)
+        session.commit()
+        artifact_id = artifact.id
+    headers = h.headers()
+    assert h.create(headers=headers).status_code == 201
+    assert h.create(headers=headers, artifact=artifact_id).status_code == 409
+    assert (
+        h.create(
+            headers=headers,
+            payload={
+                "artifact_id": str(artifact_id),
+                "runtime_template": "unsupported",
+            },
+        ).status_code
+        == 422
+    )
+    with Session(h.engine) as session:
+        project = session.get(Project, h.projects[0])
+        project.owner_id = session.get(Project, h.projects[2]).owner_id
+        session.commit()
+    assert h.create(headers=headers).status_code == 404
+
+
+def test_unrelated_unique_failure_is_not_treated_as_replay(h, monkeypatch):
+
+    class FailingSession(Session):
+        def commit(self):
+            # A real, unrelated unique violation in the same transaction.
+            record = next(
+                obj for obj in self.identity_map.values() if isinstance(obj, Run)
+            )
+            self.connection().execute(
+                Run.__table__.insert().values(
+                    id=record.id,
+                    project_id=h.projects[0],
+                    artifact_id=h.artifacts[0],
+                    runtime_template="python-fastapi-v1",
+                )
+            )
+            return super().commit()
+
+    monkeypatch.setattr(auth, "Session", FailingSession)
+    assert h.create().status_code == 503
+    assert h.count() == h.before
+
+
+def test_scoped_key_lock_wait_is_bounded_and_rollback_is_atomic(h):
+    from concurrent.futures import ThreadPoolExecutor
+    from time import monotonic
+
+    from lavan.models import RunIdempotency
+    from lavan.runs import OPERATION, request_fingerprint
+
+    headers = h.headers()
+    # Hold the exact scope unique key uncommitted on a separate connection.
+    with Session(h.engine) as blocker:
+        user_id = blocker.get(Project, h.projects[0]).owner_id
+        run = Run(
+            project_id=h.projects[0],
+            artifact_id=h.artifacts[0],
+            runtime_template="python-fastapi-v1",
+        )
+        blocker.add(run)
+        blocker.flush()
+        blocker.add(
+            RunIdempotency(
+                user_id=user_id,
+                operation=OPERATION,
+                key=headers["Idempotency-Key"],
+                fingerprint=request_fingerprint(
+                    h.projects[0], h.artifacts[0], "python-fastapi-v1"
+                ),
+                run_id=run.id,
+            )
+        )
+        blocker.flush()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            start = monotonic()
+            response = executor.submit(h.create, headers=headers).result(timeout=5)
+            elapsed = monotonic() - start
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Service unavailable"}
+        assert 1 <= elapsed < 3
+        blocker.rollback()
+    assert h.count() == h.before
+    assert h.create(headers=headers).status_code == 201
+
+
+@pytest.mark.parametrize("key", ["a", "A_Z-09." * 18 + "Az"])
+def test_valid_key_boundaries(h, key):
+    # Second case is exactly 128 ASCII characters.
+    headers = {**h.headers(), "Idempotency-Key": key}
+    first = h.create(headers=headers)
+    assert first.status_code == 201
+    assert h.create(headers=headers).json() == first.json()

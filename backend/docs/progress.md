@@ -474,3 +474,75 @@ UUID-named disposable databases. No checks remain blocked.
 
 Next milestone: idempotency and lifecycle processing with a simulated runner.
 Milestone 6B/lifecycle processing has not started.
+
+
+## Milestone 6B — durable idempotent run creation (verified)
+
+Implemented required Idempotency-Key validation (exactly one header, 1–128 ASCII
+letters/digits/period/underscore/hyphen, case-sensitive, no normalization).
+The durable user/operation/key composite primary key scopes retries across the
+user's projects. Canonical versioned semantic fingerprints use SHA-256. Run and
+retry record commit atomically; PostgreSQL ON CONFLICT targets only that primary
+key, rolls back a losing run, and reads the committed winner. Other database
+failures remain sanitized 503. Authorization and artifact membership precede
+conflict/replay decisions. Locks wait at most 1500ms; statement timeout remains
+2000ms. No lifecycle processing, execution, quotas, expiration, or key cleanup.
+
+Verification:
+- `uv sync --locked`, Ruff lint and formatting checks passed; no dependency changes.
+- **185 tests passed, none skipped**, with LAVAN_POSTGRES_TESTS=1 against real
+  PostgreSQL and isolated disposable databases. The existing HTTPX/Starlette
+  deprecation warning remains; no dependency upgrade was made for it.
+- Synchronized separate PostgreSQL connections verified identical requests yield
+  one run/record and conflicting requests yield one 201 and one 409. Backend PID
+  assertions confirm separate connections. Atomic failure leaves neither record;
+  unrelated unique errors remain 503. A deliberately held key lock produces
+  bounded 503, releases resources, and permits a subsequent successful retry.
+- Header boundaries/duplicates, semantic JSON/UUID equivalence, fingerprint
+  template sensitivity, user/case scopes, resource authorization before conflicts,
+  revoked replay, legacy run retrieval, existing constraints, disposable-only
+  downgrade/re-upgrade with pre-existing runs, and metadata comparison passed.
+- Docker build and quiet Compose configuration validation passed.
+- Confirmed Compose target postgres:5432 / lavan_dev at 0004_runs before explicit
+  upgrade. Existing counts (7 users, 3 projects, 2 artifacts, 1 run, 7 tokens)
+  were unchanged by migration. Current and head now equal 0005_run_idempotency;
+  Alembic check reports no pending operations. No applied migration was edited.
+
+Actual HTTP checks against the rebuilt Compose API and real development PostgreSQL:
+
+| Check | HTTP | Seconds |
+| --- | --- | --- |
+| Create project | 201 | 0.123325 |
+| Upload artifact 1 | 201 | 0.055966 |
+| Upload artifact 2 | 201 | 0.030609 |
+| Create run | 201 | 0.036582 |
+| Replay with reordered/formatted JSON | 201 | 0.015283 |
+| Conflicting valid artifact, same key | 409 | 0.012318 |
+| Other user attempts create/replay | 404 | 0.013028 |
+| Concurrent identical request 1 | 201 | 0.032519 |
+| Concurrent identical request 2 | 201 | 0.032012 |
+| Retrieve owned run | 200 | 0.012559 |
+| Revoked-token replay | 401 | 0.013116 |
+| Liveness | 200 | 0.001445 |
+| Readiness | 200 | 1.411961 |
+
+Asserted exact replay body and Location equality, concurrent response equality,
+and exactly two persisted runs plus two retry records for the two successful
+keys; the conflict left no extra run. Tokens and raw keys stayed in memory and
+were not printed or stored in verification files. Retained local records:
+- User A: de4f5fa9-c359-4902-a2ed-ca412ceef206
+- User B: 92b7dfa7-4466-46bc-a1d5-409e09580d65
+- Project: 8705ca91-9b63-46d6-9901-a454287aaafc
+- Artifacts (private files retained): 22ed435a-774c-43ce-946e-a5a02a752984,
+  11e444d6-42c2-48dc-8fbc-fc7680182fd8
+- Sequential/replayed run: ea850f7a-7e47-4fa8-a8f5-0761f7b2432d
+- Concurrent run: dcbf07c5-d936-4b46-8ef1-0cbd8005c9fa
+- Revoked token IDs: 860f0ddb-3db8-485a-8e12-ff186ffbc540,
+  571beb74-3aaa-4af9-93bd-0ab5fe8b622d
+
+Finally revoked both verification tokens and restored API and PostgreSQL to
+stopped, matching initial state. Development data, artifact files, and both
+project volumes were preserved; no development downgrade/reset/stamp occurred.
+No checks remain blocked. Keys remain valid while retained; future lifecycle
+work must explicitly revisit replay representation before making status mutable.
+Next milestone: lifecycle processing with a simulated runner. It has not started.

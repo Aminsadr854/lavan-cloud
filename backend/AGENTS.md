@@ -1,10 +1,11 @@
 # Scope
-Milestones 1–6A: local FastAPI/PostgreSQL infrastructure, users/projects models,
+Milestones 1–6B: local FastAPI/PostgreSQL infrastructure, users/projects models,
 explicit migrations, local user provisioning, API-token authentication, and
 authenticated projects, private ZIP artifacts, and queued execution-request records.
 Never extract/decompress uploaded payloads. Do not add listing, editing, deletion,
 downloads, dispatch/execution, lifecycle processing, workers, runners, or CI
-without a new milestone request. Runs remain queued; no quotas or idempotency yet.
+without a new milestone request. Runs remain queued with durable idempotency;
+no lifecycle processing or quotas.
 Keep secrets and runtime data outside Git. Preserve unrelated work.
 
 # Verification
@@ -17,5 +18,5 @@ Run real schema tests with `LAVAN_POSTGRES_TESTS=1 uv run pytest`. They create
 and remove a uniquely named disposable database; never downgrade development data.
 Read docs/schema.md for the supported timestamp write path.
 
-Never log raw API tokens, authorization headers, or credentials. Token output is
-allowed only after successful issuance commit through the local management command.
+Never log raw API tokens, authorization headers, idempotency keys, or credentials.
+Token output is allowed only after successful issuance commit through the local management command.

@@ -190,7 +190,10 @@ def test_second_migration_preserves_users_on_downgrade(migrated):
     migration(engine, name, command.upgrade, "head")
     with engine.connect() as c:
         assert "api_tokens" in inspect(c).get_table_names()
-        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0004_runs"
+        assert (
+            c.scalar(text("SELECT version_num FROM alembic_version"))
+            == "0005_run_idempotency"
+        )
 
 
 def test_auth_database_work_is_off_loop_and_session_closes(client, capsys, monkeypatch):

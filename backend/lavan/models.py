@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     MetaData,
+    PrimaryKeyConstraint,
     String,
     UniqueConstraint,
     func,
@@ -120,4 +121,23 @@ class Run(Base):
     runtime_template: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunIdempotency(Base):
+    __tablename__ = "run_idempotency"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "user_id", "operation", "key", name="pk_run_idempotency_scope"
+        ),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), primary_key=True
+    )
+    operation: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("runs.id", ondelete="RESTRICT"), unique=True
     )

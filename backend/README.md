@@ -473,13 +473,16 @@ other-owner access return the same sanitized 404. No filesystem paths, storage
 keys, source, or user ownership details are returned.
 
 After explicit `alembic upgrade head` using the existing WSL or Compose commands,
-head is `0004_runs`. With an API_TOKEN held securely as described in milestone 3:
+head is `0005_run_idempotency`. With an API_TOKEN held securely as described
+in milestone 3:
 
 ```bash
 PROJECT_ID="<owned-project-uuid>"
 ARTIFACT_ID="<artifact-uuid-in-that-project>"
 set +x
-printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+IDEMPOTENCY_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+printf 'header = "Authorization: Bearer %s"\nheader = "Idempotency-Key: %s"\n' \
+  "$API_TOKEN" "$IDEMPOTENCY_KEY" |
   curl --config - --include --fail-with-body --max-time 5 \
     --header 'Content-Type: application/json' \
     --data "{\"artifact_id\":\"$ARTIFACT_ID\",\"runtime_template\":\"python-fastapi-v1\"}" \
@@ -494,9 +497,9 @@ printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
 **Every run remains queued indefinitely in this milestone. Nothing executes
 these requests automatically.** There is no worker, background task, queue,
 cancellation, expiration processing, logging stream, listing, or active-run quota.
-Idempotency keys are not implemented; repeated POSTs create separate records.
-Clients must not blindly retry an uncertain submission (for example, a timeout
-may occur after commit). Idempotency-Key headers do not deduplicate requests yet.
+Milestone 6B requires Idempotency-Key on creation, as described below.
+Different keys intentionally create separate records; keep the original key and
+payload when retrying an uncertain submission (a timeout can occur after commit).
 
 The database also enforces artifact/project consistency via a composite FK and
 rejects deletion of referenced artifacts/projects without cascades. Status and
@@ -504,4 +507,44 @@ template constraints allow only the values above; later migrations will extend
 them as lifecycle processing is introduced. Real PostgreSQL tests include direct
 constraint violations and disposable-only downgrade/re-upgrade checks. Restore
 service state after verification and preserve all development volumes/records.
-Next milestone: idempotency and lifecycle processing with a simulated runner.
+Next milestone: lifecycle processing with a simulated runner.
+
+
+## Milestone 6B: idempotent run creation
+
+POST run creation requires exactly one `Idempotency-Key` header: 1–128 ASCII
+letters, digits, hyphens, underscores, or periods. Keys are case-sensitive and
+are never trimmed. Missing, empty, invalid, or duplicate headers return sanitized
+422. Keep keys private; do not enable shell tracing or log header values.
+
+Keys are scoped to the authenticated user and the `run.create` operation across
+all their projects. They are retained indefinitely; no expiry or cleanup exists.
+The same key and semantic payload return **201**, the same Location, and the
+same persisted response. JSON spacing/order and UUID letter case do not matter.
+A different valid project, artifact, or template with that key returns sanitized
+409. Unsupported templates still return 422. Authentication and resource
+ownership/artifact membership are checked before replay/conflict decisions, so
+inaccessible resources remain 404 and revoked tokens remain 401.
+
+Reuse both the original key and payload after a timeout or uncertain outcome.
+The example above generates a key without echoing it and supplies it through
+curl's configuration input; keep the variable unchanged for retries. Use a new
+key only when a separate run is intended. Do not put literal tokens or keys in
+shell history. After verification, revoke the token and unset both variables.
+
+A PostgreSQL scope primary key arbitrates concurrent writers. Run creation and
+its retry record commit atomically: identical concurrent submissions resolve to
+one persisted run; conflicting submissions have one winner and a 409 loser.
+Lock waits are bounded at 1.5 seconds (statements at 2 seconds); database outages
+or contention may return sanitized 503. Retry uncertain results with the same
+key/payload. No in-memory lock is used. Fingerprints use versioned canonical JSON
+and SHA-256, not raw request bytes. Existing runs remain readable without keys.
+
+Runs remain queued and nothing executes them. Because status is currently
+immutable, re-rendering the stored run preserves its representation. Future
+lifecycle work must explicitly revisit replay behavior when status becomes mutable.
+
+Apply explicitly with `docker compose run --rm --no-deps api /app/.venv/bin/alembic upgrade head`
+after rebuilding the API. Current head is `0005_run_idempotency`. Integration
+checks use `LAVAN_POSTGRES_TESTS=1 uv run pytest` and disposable PostgreSQL
+databases, including synchronized concurrent writers and bounded lock contention.

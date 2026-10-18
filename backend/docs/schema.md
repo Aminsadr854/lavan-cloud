@@ -80,7 +80,33 @@ No metadata/files are cascade-deleted. The downgrade removes runs and the new
 pair constraint, preserving artifacts/projects; only disposable tests run it.
 
 All records stay queued; no lifecycle processing exists. The runtime template is
-an explicit client selection, not source-compatibility validation. Repeated POSTs
-produce independent records: no quotas or idempotency keys are implemented yet.
+an explicit client selection, not source-compatibility validation. Milestone 6B
+adds idempotency below; different keys produce independent records. No quotas
+are implemented.
 Future milestones must explicitly migrate the status constraint/schema before
 adding lifecycle transitions; no speculative lifecycle columns are present here.
+
+
+## Milestone 6B: run_idempotency
+
+`0005_run_idempotency` adds a durable retry table without changing existing runs.
+Its composite primary key `pk_run_idempotency_scope` is `(user_id, operation, key)`;
+key is VARCHAR(128) with PostgreSQL C collation for case-sensitive equality.
+User and run foreign keys use RESTRICT; run_id is unique. Fingerprint is the
+SHA-256 of deterministic compact, sorted-key JSON containing version=1,
+canonical project/artifact UUID strings and runtime_template. Operation is
+`run.create`. No key backfill, expiration, or automatic deletion occurs.
+
+The run and key record are inserted in one transaction. PostgreSQL ON CONFLICT
+explicitly targeting the scope primary key triggers rollback-and-read of a
+concurrent winner; unrelated constraints and database
+errors are not suppressed and remain sanitized service failures. Expected
+conflicts do not emit database errors containing raw key values. Authorization
+is checked before lookup and again after a uniqueness rollback. Local lock_timeout
+is 1500ms; existing statement_timeout is 2000ms. Sessions close on every path and
+synchronous database calls remain on FastAPI's worker threads.
+
+No raw key is exposed by API responses or logs. Existing runs without retry
+records remain accessible. Replays render the same queued run with 201 and its
+original Location. Later lifecycle work must revisit this contract before making
+status mutable. A new key intentionally creates a separate run.

@@ -22,10 +22,11 @@ def tick(engine, lease, settings, runner):
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
         renew(session, job, lease, settings)
-        if run.status == "queued":
+        cancelling = run.cancellation_requested_at is not None
+        if not cancelling and run.status == "queued":
             move(session, job, run, lease, "preparing")
             return False
-        if run.status == "preparing":
+        if not cancelling and run.status == "preparing":
             move(session, job, run, lease, "starting")
             return False
         artifact = session.get(Artifact, run.artifact_id)
@@ -41,20 +42,30 @@ def tick(engine, lease, settings, runner):
             scenario=job.scenario,
             startup_seconds=job.startup_seconds,
             duration_seconds=job.duration_seconds,
+            stop_requested_at=run.cancellation_requested_at,
         )
         status = run.status
         clock = now(session)
     # Both operations are bounded/nonblocking in the simulator. A future remote
     # adapter must provide deadlines and nonblocking reconciliation, not long RPCs.
     result = (
-        runner.start(request, clock)
+        runner.stop(request, clock)
+        if cancelling
+        else runner.start(request, clock)
         if status == "starting"
         else runner.inspect(request, clock)
     )
-    if result not in {"starting", "running", "completed", "startup_failed"}:
+    if result not in {"starting", "running", "completed", "startup_failed", "stopped"}:
         raise ValueError("Unknown runner result")
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
+        if run.cancellation_requested_at is not None:
+            if cancelling and result == "stopped":
+                move(session, job, run, lease, "stopped", stop_acknowledged=True)
+                return True
+            return False  # intent won; discard a normal result and stop next tick
+        if result == "stopped":
+            raise ValueError("Unrequested runner stop")
         if result == "startup_failed":
             move(session, job, run, lease, "failed", "simulated_startup_failure")
             return True

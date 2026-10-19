@@ -35,7 +35,9 @@ current unexpired lease/fence before applying a result. Late results from stale
 workers are discarded. Shared transition rules permit queued → preparing →
 starting → running → completed, or failed from any nonterminal state; terminal
 states cannot be overwritten. Runner transport/infrastructure exceptions retry;
-simulated startup failure is terminal. Exhausted attempts are terminal failed.
+simulated startup failure is terminal absent committed cancellation intent.
+Exhausted normal attempts are terminal failed; cancellation reconciliation is
+covered by the extension below.
 
 A future real runner must implement durable start-operation deduplication,
 status reconciliation after ambiguous timeouts, and fencing of stale commands.
@@ -50,3 +52,43 @@ POST replays return the original queued creation snapshot with 201 and original
 Location. GET returns mutable current state. Replay never starts or enqueues work.
 This contract intentionally replaces milestone 6B's immutable-run assumption
 without changing request fingerprint v1 or expiring keys.
+
+
+## Version 1 cancellation extension (milestone 7A)
+
+The additive request field stop_requested_at is the persisted run cancellation
+instant. accepted_at may be absent for a previously claimed run cancelled before
+start was persisted. Existing start operation identities and request fingerprints
+are unchanged. `stop(request, now)` targets the same `run:<UUID>:start:v1` logical
+execution; repeated calls are idempotent. The result vocabulary adds stopped.
+
+The simulator is a pure logical timeline with no external side effects. Persisted
+stop_requested_at anchors termination; stop acknowledges stopped immediately,
+and inspect with that same anchor reconciles stopped. Slow-start delays are
+cooperative polls, not blocking sleeps. Start is never invoked by a worker that
+observes intent; a stale request/result without the anchor is fenced from mutation.
+A crash after stop acknowledgement and before state commit is recovered by another
+stop/inspect on the same logical identity, not a second execution. No extra
+filesystem or runner-local memory is needed to preserve simulated cancellation.
+
+Only the first owner request appends cancel_requested. The worker may append
+stopped only after runner acknowledgement under its current live lease/fence.
+The exception is an inline API transition when a locked queued run has no job,
+or a pending job has zero attempts/fence and no start anchor: no operation could
+have started. Job metadata is retained. Previously attempted queued runs always
+require reconciliation, including exhausted/backoff jobs.
+
+Lock/commit order defines the race: terminal completion/failure first is final;
+intent first blocks all later normal state progression and normal terminal
+failure, including infrastructure retry exhaustion. Pending cancellation is
+promptly claimable. Stop transport failures retain intent and retry with bounded
+backoff until acknowledged; the ordinary execution-attempt budget cannot justify
+false termination. Every ownership recovery increments the fence. No transaction
+is held across stop/inspect/start calls or runner waits.
+
+Future physical runners must implement stop deduplication, status reconciliation,
+and confirmed termination (including already-exited operations) with bounded RPCs
+and fencing. A database flag or expired lease cannot prove physical termination.
+The current serial worker assumes nonblocking operations; arbitrary long RPCs
+would need heartbeat-capable adapters. Exactly-once physical execution, real
+sandbox control, expiration, and streaming remain outside this implementation.

@@ -127,7 +127,10 @@ def test_create_persist_and_retrieve_queued_run(h):
             == 1
         )
     fetched = h.client.get(response.headers["location"], headers=h.headers())
-    assert fetched.status_code == 200 and fetched.json() == body
+    assert fetched.status_code == 200 and fetched.json() == {
+        **body,
+        "cancellation_requested_at": None,
+    }
 
 
 def test_repeated_posts_create_separate_queued_records_without_quotas(h):

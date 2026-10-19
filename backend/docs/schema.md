@@ -124,8 +124,8 @@ The shared transition path permits each consecutive success state, or failed
 from any nonterminal state. Terminal runs cannot be revived. New updated_at is
 non-null timestamptz with now() default; old values are initialized to created_at.
 Worker transitions maintain updated_at with database UTC time. Nullable error_code
-stores only controlled codes, not exceptions. The public GET retains the six-field
-response and reads mutable status; POST/replay renders stored creation_response,
+stores only controlled codes, not exceptions. GET reads mutable status (milestone
+7A adds its nullable cancellation timestamp); POST/replay renders stored creation_response,
 not the mutable row. Original Location is derived from unchanged project/run IDs.
 
 `execution_jobs` has an application UUID PK, unique restrictive run FK, pending /
@@ -164,3 +164,44 @@ outside transactions. No deletion cascades or key/job expiry exist.
 Downgrade is tested only on disposable databases. It refuses nonqueued runs rather
 than rewrite completed/failed history into queued. Development migrations are
 upgrade-only: never reset, downgrade, stamp, or delete development volumes.
+
+
+## Milestone 7A: durable cancellation
+
+0007_run_cancellation adds nullable timestamptz cancellation_requested_at to runs
+and extends the run/job state constraints with terminal stopped. Existing statuses,
+creation snapshots, request fingerprints, artifacts, and events are not rewritten.
+No cancellation reason is needed; error codes retain their existing meanings.
+
+GET/cancellation schemas include the nullable timestamp. The creation response
+schema and JSONB snapshots exclude it, preserving exact creation replays after
+stopping. Only the first nonterminal cancellation stamps database UTC time and
+appends an ordered cancel_requested event (an intent marker in the existing
+16-character event status column, not a run status). A stopped transition adds
+its own UUID event under the same per-run ordering/locking rules.
+
+Cancellation and worker paths lock job then run. The unscheduled/enqueue race
+restarts the cancellation transaction if a job appeared while acquiring the run
+lock, preserving lock order. Authentication/ownership and URL consistency are
+rechecked. Inline stopping requires queued plus no job, or a pending, never-claimed
+job (zero attempts/fence and no start anchor). Otherwise intent remains durable
+until a fenced worker reconciles the runner. Job rows are never deleted for cancel.
+
+Normal terminal completion/failure committed first remains unchanged. Intent
+committed first prevents every subsequent normal transition; only acknowledged
+stopped may follow. State, intent event, stopped event, and job result commit
+atomically where applicable. Repeated requests add no event or new job. Stale
+workers cannot append events or change stopped/terminal outcomes.
+
+Backoff is advanced to current database time on cancellation. Normal attempt
+counts remain capped at max_attempts; cancellation recovery continues with higher
+fences even beyond that budget. Stop transport failures reschedule pending work
+with at most 0.25s backoff, retaining intent until acknowledgement. Ordinary
+execution failures retain the previous bounded retries. Simulator termination is
+deterministic from persisted intent and stable operation identity; no payload or
+physical execution is involved.
+
+Disposable migration tests preserve completed/failed jobs, queued unscheduled
+runs, and creation snapshots across upgrade/downgrade. Downgrade refuses any
+cancellation history rather than silently discard intent or relabel stopped runs.
+Development migrations remain upgrade-only, with all volumes and records retained.

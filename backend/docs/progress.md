@@ -654,3 +654,114 @@ a future remote runner needs operation deduplication, fencing, bounded RPCs, and
 status reconciliation. Processing is at-least-once, not exactly-once physical
 execution. Internal events and error codes have no new public endpoint.
 Milestone 6C is complete; no later milestone or real-runner work has started.
+
+
+## Milestone 7A — authenticated durable cancellation (verified)
+
+Added owner-scoped POST /v1/projects/{project_id}/runs/{run_id}/cancel with
+sanitized authentication/resource errors and forbidden client fields. Never-claimed
+queued runs stop inline with 200 (including old unscheduled rows); attempted or
+leased runs commit intent and return 202/Location pending worker acknowledgement.
+Repeated requests are safe. Completed/failed outcomes remain unchanged; stopped
+is terminal. GET/cancel add nullable UTC cancellation_requested_at; creation and
+replay retain their original six fields and immutable snapshot/Location with 201.
+
+The first intent and ordered cancel_requested event commit together under the
+common job-then-run locks. Intent committed first blocks later normal progression,
+failure, and retry exhaustion; terminal outcome committed first is preserved.
+Worker stop acknowledgement, stopped event, run state, and job result commit
+atomically under a current unexpired fenced lease. No jobs are deleted. Backoff
+is advanced for prompt reconciliation; cancellation transport errors retry with
+at most 0.25s backoff until acknowledged, with normal attempt count capped and
+fencing epochs still increasing. Ordinary runs keep bounded normal retries.
+
+Runner contract v1 gains idempotent stop on the existing logical operation and
+the durable stop_requested_at anchor. Simulator stop/inspect confirms termination
+without payload access, including before a logical start anchor exists. Stage
+checks, bounded waits, and terminal-result checks prevent late normal/stale
+results from overwriting intent or stopped. No database transaction spans runner
+calls. Future physical runners must confirm termination, not merely set flags.
+
+Verification:
+- **237 tests passed, none skipped**, against real PostgreSQL using UUID-named
+  disposable databases. One pre-existing Starlette/HTTPX warning remains.
+- Verified unscheduled/unclaimed and queued-attempted cancellation; preparing,
+  starting, running; prompt slow startup (<2s); repeated/concurrent requests;
+  completed/failed preservation; all auth/ownership/malformed UUID/client-field
+  errors; intent/event/job rollback; unchanged creation snapshots after stop.
+- Controlled runner hooks verified cancellation before late completion, startup
+  failure, and transport exceptions; a lock-controlled terminal-first case remains
+  completed. Backoff/exhausted jobs reconcile promptly rather than becoming failed.
+- A real worker process was SIGKILLed after simulator stop acknowledgement but
+  before database persistence. Another process reclaimed the expired lease and
+  finalized stopped on attempt 2 with one intent/stopped event and no duplicate
+  phases. A late stop acknowledgement from a lower-fence worker was rejected.
+- Explicit enqueue racing cancellation exercised the bounded transaction restart
+  needed to preserve job/run lock order. Stopped jobs/runs cannot be revived.
+- Upgrade/downgrade/re-upgrade preserved completed/failed jobs, queued unscheduled
+  runs, and existing creation snapshots. Downgrade refuses cancellation history.
+  Existing schema metadata comparison and all previous tests passed.
+- Ruff lint/format, uv sync --locked, quiet Compose validation, and API/worker
+  Docker builds passed. No dependency changes or edits to applied migrations.
+- Confirmed Compose postgres:5432 / lavan_dev at 0006_simulated_lifecycle before
+  upgrade. Existing counts (11 users, 5 projects, 5 artifacts, 5 runs, 11 tokens,
+  4 retry records, 2 jobs, 7 events), states, fingerprints, and snapshot digest
+  were unchanged; new cancellation timestamps were null. Applied only
+  0007_run_cancellation; current equals head, and Alembic check is clean.
+
+Actual HTTP/worker smoke check (local slow-startup=10s configuration):
+
+| Check | HTTP | Seconds |
+| --- | --- | --- |
+| Create project | 201 | 0.265623 |
+| Upload inert ZIP | 201 | 0.068457 |
+| Create slow run | 201 | 0.063517 |
+| Observe starting | 200 | 0.268153 |
+| Request active cancellation | 202 | 0.040531 |
+| Cancellation acknowledged | 200 | 0.111540 |
+| Repeat stopped cancellation | 200 | 0.025219 |
+| Replay stopped creation | 201 | 0.026515 |
+| Other-user cancellation | 404 | 0.022092 |
+| Create never-claimed run | 201 | 0.050491 |
+| Cancel never-claimed run | 200 | 0.040204 |
+| Repeat inline cancellation | 200 | 0.027661 |
+| Revoked-token cancellation | 401 | 0.021317 |
+| Liveness | 200 | 0.002521 |
+| Readiness | 200 | 1.881568 |
+
+The active request returned 202/current starting state with intent and GET Location;
+subsequent bounded polling observed stopped in 0.111540s after the request returned.
+Repeat cancellation returned the same stopped representation. Creation replay was
+byte-equivalent in body fields and preserved Location, still queued without the
+new timestamp field. A second run, created while the worker was stopped, cancelled
+inline with 200 and zero attempts. Each retained job has exactly one intent and
+one stopped event; the first also retains preparing/starting events. Existing
+three queued runs and completed/failed records were untouched. Both health bodies
+were verified; readiness remained within the established bounded response target.
+
+Retained local verification records:
+- users: 5c8fd84b-44b9-4dc8-b58e-41fbe2f9ed92, be9b417e-fb87-4bad-a33c-1bb90c42ff4f
+- project: 3d429049-16c1-47cb-8a1a-c40ee6346444
+- artifact: 6d42763c-eca2-4dea-baa4-40b1fae40934
+- active_cancel_run: 95d30b48-c297-4071-88c9-a9a8276947bd
+- unclaimed_cancel_run: f0381ae7-7933-4fd1-8338-9c048bda2af5
+- revoked_token_ids: 66f9a549-27e1-45b3-997b-6efdd3212660, bed6f8b8-6585-4712-9021-5578cce79cac
+- Job a556526f-95b4-41c5-895a-423e1d17e60f: run 95d30b48-c297-4071-88c9-a9a8276947bd, attempts=1, events preparing → starting → cancel_requested → stopped.
+- Job 84000ef7-0596-4037-a7df-91fc409d5aa9: run f0381ae7-7933-4fd1-8338-9c048bda2af5, attempts=0, events cancel_requested → stopped.
+
+Raw tokens/keys remained in memory and were never printed or written to tracked
+files. Both verification tokens were revoked in final cleanup. Successful project,
+private artifact file, stopped runs/jobs, replay records, and events are retained.
+Existing development data and both volumes were preserved; no development reset,
+downgrade, stamp, or record deletion occurred. API/PostgreSQL are stopped; worker
+is created but stopped. Its exact initial success scenario, timing, poll, lease,
+and retry configuration was restored and independently compared to the initial
+nonsecret configuration capture. No checks remain blocked.
+
+Limitations: 202 is durable acceptance, not confirmation of termination. A healthy
+available simulator worker normally stops within 2s; missing workers/infrastructure
+or expired-lease recovery can take longer. Intent persists and retries reconciliation
+until acknowledgement, without expiration. There is no physical execution to stop;
+a future runner needs confirmed stop, deduplication, reconciliation, and fencing.
+No expiration, SSE, general log streaming, or real sandbox work was implemented.
+Milestone 7A is complete; no later milestone has started.

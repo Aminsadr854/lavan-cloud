@@ -7,13 +7,14 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from lavan.auth import authenticated_user, get_session
+from lavan.jobs import CancellationBusy, request_cancellation
 from lavan.models import Artifact, ExecutionJob, Project, Run, RunIdempotency, User
 
 router = APIRouter(prefix="/v1/projects/{project_id}/runs")
@@ -30,9 +31,19 @@ class RunResponse(BaseModel):
     id: UUID
     project_id: UUID
     artifact_id: UUID
-    status: Literal["queued", "preparing", "starting", "running", "completed", "failed"]
+    status: Literal[
+        "queued", "preparing", "starting", "running", "completed", "failed", "stopped"
+    ]
     runtime_template: Literal["python-fastapi-v1"]
     created_at: datetime
+
+
+class RunCurrentResponse(RunResponse):
+    cancellation_requested_at: datetime | None
+
+
+class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 OPERATION = "run.create"
@@ -142,7 +153,7 @@ def create_run(
     return RunResponse.model_validate(record.creation_response)
 
 
-@router.get("/{run_id}", response_model=RunResponse)
+@router.get("/{run_id}", response_model=RunCurrentResponse)
 def get_run(
     project_id: UUID,
     run_id: UUID,
@@ -160,4 +171,36 @@ def get_run(
     )
     if run is None:
         raise HTTPException(404, "Not found")
-    return RunResponse.model_validate(run)
+    return RunCurrentResponse.model_validate(run)
+
+
+@router.post(
+    "/{run_id}/cancel",
+    response_model=RunCurrentResponse,
+    responses={
+        202: {
+            "model": RunCurrentResponse,
+            "description": "Durable cancellation awaiting worker acknowledgement",
+        }
+    },
+)
+def cancel_run(
+    project_id: UUID,
+    run_id: UUID,
+    response: Response,
+    user: Annotated[User, Depends(authenticated_user)],
+    session: Annotated[Session, Depends(get_session)],
+    payload: Annotated[CancelRequest | None, Body()] = None,
+):
+    try:
+        run, pending = request_cancellation(session, user.id, project_id, run_id)
+    except LookupError:
+        raise HTTPException(404, "Not found") from None
+    except CancellationBusy:
+        raise HTTPException(503, "Service unavailable") from None
+    body = RunCurrentResponse.model_validate(run)
+    session.commit()
+    response.status_code = 202 if pending else 200
+    if pending:
+        response.headers["Location"] = f"/v1/projects/{project_id}/runs/{run_id}"
+    return body

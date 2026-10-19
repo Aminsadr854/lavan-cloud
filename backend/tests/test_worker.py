@@ -87,14 +87,14 @@ def work(migrated):
 
 
 def settings(**overrides):
-    return Settings(
+    values = dict(
         worker_lease_seconds=0.4,
         worker_poll_seconds=0.02,
         worker_retry_seconds=0.05,
         simulator_startup_seconds=0,
         simulator_duration_seconds=0,
-        **overrides,
     )
+    return Settings(**(values | overrides))
 
 
 def schedule(work):

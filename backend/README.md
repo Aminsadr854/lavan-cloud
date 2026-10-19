@@ -1,4 +1,4 @@
-# Lavan backend: milestones 1–6C
+# Lavan backend: milestones 1–7A
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
@@ -474,7 +474,7 @@ other-owner access return the same sanitized 404. No filesystem paths, storage
 keys, source, or user ownership details are returned.
 
 After explicit `alembic upgrade head` using the existing WSL or Compose commands,
-head is `0006_simulated_lifecycle`. With an API_TOKEN held securely as described
+head is `0007_run_cancellation`. With an API_TOKEN held securely as described
 in milestone 3:
 
 ```bash
@@ -497,7 +497,7 @@ printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
 
 **Milestones 6A/6B originally left runs queued. Milestone 6C adds the simulated
 worker described below.** Existing runs remain unscheduled until explicitly
-enqueued. There is still no real execution, cancellation, expiration processing,
+enqueued. There is still no real execution or expiration processing,
 logging stream, listing, or active-run quota.
 Milestone 6B requires Idempotency-Key on creation, as described below.
 Different keys intentionally create separate records; keep the original key and
@@ -548,7 +548,7 @@ creation snapshot, while GET returns current lifecycle state. A replay never
 schedules another job or restarts processing.
 
 Apply explicitly with `docker compose run --rm --no-deps api /app/.venv/bin/alembic upgrade head`
-after rebuilding the API. Current head is `0006_simulated_lifecycle`. Integration
+after rebuilding the API. Current head is `0007_run_cancellation`. Integration
 checks use `LAVAN_POSTGRES_TESTS=1 uv run pytest` and disposable PostgreSQL
 databases, including synchronized concurrent writers and bounded lock contention.
 
@@ -582,8 +582,8 @@ Any nonterminal state may become `failed`. Terminal states cannot be revived.
 Transitions lock the job and run, verify the live lease and fencing identity,
 and commit the run, ordered UUID transition event, and job result atomically.
 Events are internal transition records, with no streaming/logging API. Run
-updated_at and sanitized error_code are persisted internally; the public run
-response retains its existing six fields.
+updated_at and sanitized error_code are persisted internally; creation/replay keeps its existing six fields. Milestone 7A adds the nullable
+intent timestamp only to GET/cancellation responses.
 
 `running` means a simulated test execution started; `completed` means it finished.
 **No app listens on a port. No upload is opened, extracted, installed, or executed.**
@@ -642,4 +642,90 @@ including real worker SIGKILL recovery, lease renewal, stale-worker rejection,
 retry exhaustion, snapshot backfill, and unchanged authentication constraints.
 Run Ruff checks and `uv sync --locked` as before. To stop after verification,
 `docker compose stop worker api postgres` preserves both development volumes.
-No cancellation, expiration, SSE, quotas, remote runner, or real execution exists.
+Milestone 7A adds cancellation below. No expiration, SSE, quotas, remote runner,
+or real execution exists.
+
+
+## Milestone 7A: authenticated cancellation
+
+`POST /v1/projects/<project-uuid>/runs/<run-uuid>/cancel` requires Bearer auth.
+It accepts no state/ownership fields; send no body or an empty JSON object.
+Extra fields and malformed UUIDs return 422. Missing/invalid/revoked credentials
+return 401; nonexistent, mismatched, and other-owner resources share sanitized 404.
+No Idempotency-Key is needed: cancellation is intrinsically safe to repeat.
+
+- **200**: the run stopped safely in this request, was already stopped, or was
+  already completed/failed (unchanged). Never-claimed queued jobs and old unscheduled
+  queued runs stop atomically without execution. Associated jobs are retained as
+  stopped with zero attempts; no job is created for an unscheduled queued run.
+- **202**: cancellation intent committed, but worker/runner acknowledgement is
+  still required. Location is the existing GET URL. **202 does not mean stopped.**
+  A queued run with prior attempts or a lease also requires acknowledgement.
+- GET and cancellation responses add nullable UTC `cancellation_requested_at`.
+  The creation response and its immutable stored snapshot remain the original six
+  fields: replay after stopped still returns original queued body/Location and 201.
+
+Example (API_TOKEN held in a shell variable as documented above; no literal token
+in history or process arguments):
+
+```bash
+set +x
+RUN_URL="http://127.0.0.1:8000/v1/projects/<project-uuid>/runs/<run-uuid>"
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --request POST --include --fail-with-body --max-time 5 "$RUN_URL/cancel"
+printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+  curl --config - --fail-with-body --max-time 5 "$RUN_URL"
+# Repeat POST safely; poll GET with bounded requests until stopped/another terminal.
+# Revoke the verification token afterward and unset API_TOKEN.
+```
+
+Race policy is database commit order under the common job-then-run locks. If
+completed or failed commits first, later cancellation leaves it untouched without
+adding intent. If intent commits first, later normal progression, failure, and
+retry exhaustion cannot supersede it: the worker must reconcile stop. One ordered
+cancel_requested event records the first intent; one stopped event records the
+acknowledged transition. Repeated requests preserve the original timestamp/event IDs.
+No terminal state can be revived by stale or delayed workers.
+
+The worker checks intent before starting, between phases, on each bounded poll,
+and again before applying runner results. It calls idempotent stop on the same
+logical operation and rechecks its current unexpired lease/fence before recording
+stopped. Stop calls and waits hold no database transaction. The simulator confirms
+termination immediately from its durable logical cancellation anchor, even during
+slow startup; it never reads/extracts/executes the artifact. SIGKILL between stop
+acknowledgement and database commit is recovered by repeating stop with that same
+identity. A future real runner **must confirm termination**: changing a database
+state alone cannot stop physical execution.
+
+Pending retry/backoff jobs are made eligible immediately. Cancellation transport
+failures reschedule reconciliation after at most 0.25s (plus worker polling),
+without being relabeled as failed by the normal three-attempt budget. That normal
+counter is capped, while fencing epochs continue to increase. Cancellation intent
+is retained and reconciliation continues until acknowledgement; no expiration or
+cleanup exists. Normal runs retain their existing bounded retry policy.
+
+A healthy available worker normally acknowledges the simulator within two seconds.
+With no worker or unavailable infrastructure, GET may remain pending; recovery of
+a crashed owner's lease can additionally wait for its expiry. Never interpret 202
+as physical termination. Startup failure committed before cancellation remains failed.
+
+To verify active cancellation, select slow startup locally **before creating a
+fresh run** (first-claim scenario settings are persisted):
+
+```bash
+docker compose stop worker
+SIMULATOR_SCENARIO=slow_startup SIMULATOR_SLOW_STARTUP_SECONDS=10 \
+  docker compose up -d --no-deps --force-recreate worker
+# Create using the POST /runs example above. Poll its GET until starting, then
+# POST /cancel and poll GET with a bounded timeout (e.g. 20 requests, 0.1s apart).
+# Repeat cancellation and replay the original creation key/payload; snapshot stays queued.
+docker compose stop worker
+SIMULATOR_SCENARIO=success docker compose up -d --no-deps --force-recreate worker
+```
+
+Build API/worker and explicitly run Alembic upgrade head before starting these
+services after updating. Revision is 0007_run_cancellation. Run
+`LAVAN_POSTGRES_TESTS=1 uv run pytest` for real PostgreSQL races, SIGKILL recovery,
+backoff, snapshot, and migration checks; Ruff and locked checks are unchanged.
+Restore the prior worker configuration/service states, and preserve both volumes.
+Expiration, SSE, log streaming, and real sandbox integration remain out of scope.

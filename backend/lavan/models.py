@@ -109,7 +109,7 @@ class Run(Base):
         ),
         CheckConstraint(
             "status IN ('queued','preparing','starting','running',"
-            "'completed','failed')",
+            "'completed','failed','stopped')",
             name="status_supported",
         ),
         CheckConstraint(
@@ -134,6 +134,9 @@ class Run(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     error_code: Mapped[str | None] = mapped_column(String(32))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
 
 class RunIdempotency(Base):
@@ -161,7 +164,8 @@ class ExecutionJob(Base):
     __tablename__ = "execution_jobs"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('pending','leased','completed','failed')", name="state_supported"
+            "state IN ('pending','leased','completed','failed','stopped')",
+            name="state_supported",
         ),
         CheckConstraint(
             "attempts >= 0 AND fence >= 0 AND max_attempts BETWEEN 1 AND 10",

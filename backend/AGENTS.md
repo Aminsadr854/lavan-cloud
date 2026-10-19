@@ -1,13 +1,15 @@
 # Scope
-Milestones 1–6C: local FastAPI/PostgreSQL infrastructure, users/projects models,
+Milestones 1–7A: local FastAPI/PostgreSQL infrastructure, users/projects models,
 explicit migrations, local user provisioning, API-token authentication, and
 authenticated projects, private ZIP artifacts, durable jobs, and simulated lifecycle.
 Never extract/decompress uploaded payloads. Do not add listing, editing, deletion,
-downloads, real execution, cancellation, expiration, SSE, or CI without a new
+downloads, real execution, expiration, SSE, or CI without a new
 milestone request. Only the simulated runner is permitted. Never read uploaded
 payloads in the worker. Runner calls must remain outside database transactions;
 worker mutations require current fencing identity and an unexpired lease.
 Creation replays use immutable persisted snapshots; GET shows current state.
+Cancellation intent wins over later normal progression and requires runner stop
+acknowledgement unless execution is proven never claimed. Preserve terminal outcomes.
 Keep secrets and runtime data outside Git. Preserve unrelated work.
 
 # Verification

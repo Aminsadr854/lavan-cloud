@@ -546,3 +546,111 @@ project volumes were preserved; no development downgrade/reset/stamp occurred.
 No checks remain blocked. Keys remain valid while retained; future lifecycle
 work must explicitly revisit replay representation before making status mutable.
 Next milestone: lifecycle processing with a simulated runner. It has not started.
+
+
+## Milestone 6C — durable worker and simulated lifecycle (verified)
+
+Implemented PostgreSQL execution_jobs, a separate Compose worker, versioned runner
+interface, and nonblocking SimulatedRunner. Success follows queued → preparing →
+starting → running → completed; any nonterminal state can fail. Shared transitions
+lock job then run, verify lease owner/fence/expiry, allocate per-run event ordering,
+and atomically persist state/event/job result. Terminal runs cannot be revived.
+Events have stable UUIDs; there is no log stream or event endpoint.
+
+New creation commits run, one job, idempotency record, and immutable queued response
+snapshot together. Creation replay remains 201 with the original Location/body,
+while GET returns current state. Fingerprint v1 is unchanged. Old queued runs and
+snapshots are preserved without automatic job backfill; explicit local enqueue-run
+is required to schedule their simulation, idempotently while queued.
+
+Claims use FOR UPDATE SKIP LOCKED. Processing claims increment attempts/fence; the lease
+is 5s, renewed each nonblocking processing tick. Renewal's SQL predicate rejects
+already expired leases. Runner operations/waits occur outside transactions.
+Infrastructure failures use durable bounded retry scheduling, with three claims
+per job including crashes; exhaustion produces failed/retries_exhausted. Application
+startup failure is immediately terminal. First-claim scenario/timing and the
+persisted start anchor reconcile the same stable logical operation after crashes.
+No exactly-once physical execution is claimed. Graceful shutdown leaves leased
+work recoverable. The worker has no artifact-volume mount and never opens uploads.
+
+Verification results:
+- **208 tests passed, none skipped**, using LAVAN_POSTGRES_TESTS=1 and real
+  PostgreSQL disposable databases. One existing Starlette/HTTPX deprecation
+  warning remains. No dependency change was needed.
+- Success, startup_failure, slow_startup; all failure origins and terminal
+  protection; concurrent separate-connection claimers and two independent worker
+  processes; transition/event/job rollback; atomic run/job/key creation; idempotent
+  replay without extra jobs; unchanged ownership/token behavior passed.
+- A real Python worker was SIGKILLed after persisting starting; a second process
+  reclaimed after lease expiry, completed on attempt 2, retained the original
+  start anchor/scenario despite different restart configuration, and preserved
+  existing event IDs/order without duplicate phases.
+- A separate slow-start process renewed beyond the original lease and completed
+  on attempt 1; another claimant could not acquire it. A deliberately delayed
+  runner result was rejected after a higher-fence worker completed the job.
+  SIGTERM recovery, stale transition/renewal/retry rejection, retry scheduling,
+  infrastructure and crash exhaustion, and explicit management enqueue passed.
+- Empty upgrade/downgrade/re-upgrade, legacy queued runs/key snapshot backfill
+  (including zero/nonzero timestamp microseconds), no job backfill, guard rejection
+  of a false queued assumption, existing constraints, and metadata comparison
+  passed. All destructive migration checks used verified disposable databases.
+- Ruff lint/format, uv sync --locked, quiet Compose validation, and API/worker
+  Docker builds passed. The retry timing assertion was tightened to inspect the
+  durable schedule rather than assume immediate host scheduling; its focused
+  regression passed after the full suite.
+- Confirmed Compose postgres:5432 / lavan_dev at 0005_run_idempotency. Pre-migration
+  counts (9 users, 4 projects, 4 artifacts, 3 queued runs, 9 tokens, 2 retry records)
+  were unchanged. Verified all backfilled snapshots and zero jobs before worker
+  startup. Applied only upgrade head to 0006_simulated_lifecycle; current equals
+  head and Alembic check reports no pending operations. Applied migrations were
+  not edited. No development downgrade/reset/stamp occurred.
+
+Actual HTTP/Compose worker smoke checks:
+
+| Check | HTTP | Seconds | Result |
+| --- | --- | --- | --- |
+| Create project | 201 | 0.182051 |  |
+| Upload inert ZIP | 201 | 0.050274 |  |
+| Create success run | 201 | 0.045561 |  |
+| Poll success to completed | 200 | 0.677344 | completed; observed queued → preparing → starting → running → completed |
+| Replay after completed | 201 | 0.016514 |  |
+| Cross-user GET | 404 | 0.015915 |  |
+| Cross-user replay attempt | 404 | 0.019397 |  |
+| Create startup-failure run | 201 | 0.037370 |  |
+| Poll startup failure | 200 | 1.845684 | failed; observed queued → preparing → starting → failed |
+| Replay after failed | 201 | 0.019707 |  |
+| Revoked-token replay | 401 | 0.013880 |  |
+| Liveness | 200 | 0.002113 |  |
+| Readiness | 200 | 1.408607 |  |
+
+Success polling observed every forward state; failure polling observed queued →
+preparing → starting → failed. Replays after both terminal states matched their
+original queued creation bodies exactly. Each run had exactly one job and one
+attempt; success had four ordered events, failure three. Startup failure used a
+local Compose environment override; no scenario was accepted in an API request.
+The three existing queued runs stayed unscheduled. Both health bodies were checked.
+
+Retained local verification records (tokens and raw keys were never printed):
+- users: c82d4cb8-fabe-4db0-8e67-e901a34ee83e, 0564d809-2226-4565-bd09-64ec734d06d9
+- project: 7f902e91-9348-4232-b481-e0066599ceed
+- artifact: d9b0626a-3f55-4d3a-bbb4-8b80ec90acd5
+- success_run: 9e5d5143-faf5-4493-82be-8e9b1569df7d
+- failed_run: f4b5ffb9-597d-469a-9c83-6dfaf65b6ce1
+- revoked_token_ids: 16b71ebb-1777-49d6-97bb-866b124870af, baf3e1dd-e810-4695-b453-e623e98e2086
+- Job 51491498-4784-4036-b2d9-795a0e396628: run 9e5d5143-faf5-4493-82be-8e9b1569df7d, 1 attempt, events preparing → starting → running → completed.
+- Job e115b333-284e-4bb9-b2bb-0520b5baf4c3: run f4b5ffb9-597d-469a-9c83-6dfaf65b6ce1, 1 attempt, events preparing → starting → failed.
+
+Both verification tokens were revoked in final cleanup. Successful project,
+artifact file, runs, jobs, retry records, and events are retained as explicit local
+test records. Existing data and both project volumes were preserved. API and
+PostgreSQL were restored to stopped; the new worker is also stopped, with its
+container configuration restored to the default success scenario without starting
+it. API/worker logs had no unexpected errors. No checks remain blocked.
+
+Limitations: simulated execution only; no app listener, source reads, extraction,
+install, real execution, networking, preview URLs, cancellation, expiration, SSE,
+or frontend. The serial runner adapter requires immediate nonblocking operations;
+a future remote runner needs operation deduplication, fencing, bounded RPCs, and
+status reconciliation. Processing is at-least-once, not exactly-once physical
+execution. Internal events and error codes have no new public endpoint.
+Milestone 6C is complete; no later milestone or real-runner work has started.

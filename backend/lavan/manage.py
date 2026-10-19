@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from lavan.db import database_engine
+from lavan.jobs import enqueue
 from lavan.models import ApiToken, User
 from lavan.tokens import new_token, token_digest
 
@@ -20,6 +21,9 @@ def main(argv=None) -> int:
     commands.add_parser("create-user")
     commands.add_parser("issue-token").add_argument("user_id", type=UUID)
     commands.add_parser("revoke-token").add_argument("token_id", type=UUID)
+    commands.add_parser(
+        "enqueue-run", help="Explicitly schedule a queued run for simulation"
+    ).add_argument("run_id", type=UUID)
     args = parser.parse_args(argv)
     engine = database_engine()
     try:
@@ -44,7 +48,7 @@ def main(argv=None) -> int:
                     "user_id": str(args.user_id),
                     "token": raw,
                 }
-            else:
+            elif args.command == "revoke-token":
                 token_id = session.scalar(
                     update(ApiToken)
                     .where(ApiToken.id == args.token_id)
@@ -55,6 +59,14 @@ def main(argv=None) -> int:
                     raise LookupError("Token not found.")
                 session.commit()
                 result = {"token_id": str(token_id), "revoked": True}
+            else:
+                job_id = enqueue(session, args.run_id)
+                session.commit()
+                result = {
+                    "job_id": str(job_id),
+                    "run_id": str(args.run_id),
+                    "scheduled": "simulation",
+                }
         # Only committed issuance reaches stdout. Never log these results.
         print(json.dumps(result))
         return 0

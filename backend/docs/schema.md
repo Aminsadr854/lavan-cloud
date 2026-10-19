@@ -79,7 +79,7 @@ Both the direct project FK and composite artifact FK use ON DELETE RESTRICT.
 No metadata/files are cascade-deleted. The downgrade removes runs and the new
 pair constraint, preserving artifacts/projects; only disposable tests run it.
 
-All records stay queued; no lifecycle processing exists. The runtime template is
+Milestone 6A kept all records queued; milestone 6C extends this below. The template is
 an explicit client selection, not source-compatibility validation. Milestone 6B
 adds idempotency below; different keys produce independent records. No quotas
 are implemented.
@@ -107,6 +107,60 @@ is 1500ms; existing statement_timeout is 2000ms. Sessions close on every path an
 synchronous database calls remain on FastAPI's worker threads.
 
 No raw key is exposed by API responses or logs. Existing runs without retry
-records remain accessible. Replays render the same queued run with 201 and its
-original Location. Later lifecycle work must revisit this contract before making
-status mutable. A new key intentionally creates a separate run.
+records remain accessible. Milestone 6C below now persists the original queued
+response for stable 201 replays, while GET shows mutable current state. A new key
+intentionally creates a separate run.
+
+## Milestone 6C: lifecycle, jobs, events, immutable creation replay
+
+Revision `0006_simulated_lifecycle` follows unchanged 0005_run_idempotency.
+It first asserts every existing run is queued, adds JSONB creation_response to
+run_idempotency, and backfills the original six response fields with canonical
+UTC timestamp encoding. The column is then non-null. Fingerprint v1 and key
+scope are unchanged. No jobs are backfilled and old runs remain unscheduled.
+
+Run status now permits queued, preparing, starting, running, completed, failed.
+The shared transition path permits each consecutive success state, or failed
+from any nonterminal state. Terminal runs cannot be revived. New updated_at is
+non-null timestamptz with now() default; old values are initialized to created_at.
+Worker transitions maintain updated_at with database UTC time. Nullable error_code
+stores only controlled codes, not exceptions. The public GET retains the six-field
+response and reads mutable status; POST/replay renders stored creation_response,
+not the mutable row. Original Location is derived from unchanged project/run IDs.
+
+`execution_jobs` has an application UUID PK, unique restrictive run FK, pending /
+leased / completed / failed state, available_at, attempts, max_attempts (default 3),
+monotonic fence, nullable lease_owner UUID and lease_until timestamptz, and a
+sanitized last_error_code. The availability index supports polling; claim uses
+FOR UPDATE SKIP LOCKED. Checks constrain states/attempt bounds and require lease
+owner/deadline exactly when leased. Terminal job state records the run result.
+
+Scenario, bounded startup_seconds/duration_seconds, and accepted_at are internal
+simulator recovery metadata. Scenario/timing are frozen at first claim from local
+configuration; accepted_at anchors the same logical start operation across worker
+attempts. No source inspection, local path, executable command, or runner URL is
+stored. The stable operation identity is derived from run ID and contract version.
+
+`run_events` has an application UUID PK, restrictive run FK, positive sequence,
+status, optional controlled error_code, and database-default UTC created_at. The
+unique (run_id, sequence) constraint provides ordering and an index for per-run
+reads. Job-then-run locks serialize transition checks and sequence allocation;
+state, event, and terminal/retry bookkeeping commit together. Retries do not append
+another event for an already persisted state. Events are internal, not a log API.
+
+Creation commits run, job, key, and creation snapshot together. Intended key
+conflicts roll back the losing run and job before reading the winning snapshot.
+No job is added by replay. Explicit enqueue-run validates queued state and inserts
+one job under its unique run FK; repeated queued invocations return the same ID.
+
+Every worker mutation requires its current lease owner/fence and live database
+clock deadline after row locking. Renewal also checks expiry in the UPDATE itself.
+Expired leases can be reclaimed with a higher fence; attempts count claimed work,
+including crashes. Infrastructure failures schedule bounded retries; application
+startup failure is immediately terminal; exhausted attempts transition to failed
+with retries_exhausted. All SQL waits are bounded and runner operations occur
+outside transactions. No deletion cascades or key/job expiry exist.
+
+Downgrade is tested only on disposable databases. It refuses nonqueued runs rather
+than rewrite completed/failed history into queued. Development migrations are
+upgrade-only: never reset, downgrade, stamp, or delete development volumes.

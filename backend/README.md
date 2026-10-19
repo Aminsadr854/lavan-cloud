@@ -1,9 +1,10 @@
-# Lavan backend: milestones 1–6A
+# Lavan backend: milestones 1–6C
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
-and two Compose services. Opaque API-token authentication, projects, private ZIP artifacts, and queued
-execution-request persistence. No execution is dispatched.
+and three Compose services (API, PostgreSQL, simulated worker). Opaque API-token
+authentication, projects, private ZIP artifacts, and durable simulated execution
+requests. No uploaded code is read or executed.
 Run commands in WSL from `/home/agent/lavan/backend`.
 
 ## Setup
@@ -473,7 +474,7 @@ other-owner access return the same sanitized 404. No filesystem paths, storage
 keys, source, or user ownership details are returned.
 
 After explicit `alembic upgrade head` using the existing WSL or Compose commands,
-head is `0005_run_idempotency`. With an API_TOKEN held securely as described
+head is `0006_simulated_lifecycle`. With an API_TOKEN held securely as described
 in milestone 3:
 
 ```bash
@@ -494,9 +495,10 @@ printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
 # Revoke verification tokens afterward using their TOKEN_ID, then unset secrets.
 ```
 
-**Every run remains queued indefinitely in this milestone. Nothing executes
-these requests automatically.** There is no worker, background task, queue,
-cancellation, expiration processing, logging stream, listing, or active-run quota.
+**Milestones 6A/6B originally left runs queued. Milestone 6C adds the simulated
+worker described below.** Existing runs remain unscheduled until explicitly
+enqueued. There is still no real execution, cancellation, expiration processing,
+logging stream, listing, or active-run quota.
 Milestone 6B requires Idempotency-Key on creation, as described below.
 Different keys intentionally create separate records; keep the original key and
 payload when retrying an uncertain submission (a timeout can occur after commit).
@@ -507,7 +509,7 @@ template constraints allow only the values above; later migrations will extend
 them as lifecycle processing is introduced. Real PostgreSQL tests include direct
 constraint violations and disposable-only downgrade/re-upgrade checks. Restore
 service state after verification and preserve all development volumes/records.
-Next milestone: lifecycle processing with a simulated runner.
+Milestone 6C below implements simulated lifecycle processing.
 
 
 ## Milestone 6B: idempotent run creation
@@ -520,7 +522,8 @@ are never trimmed. Missing, empty, invalid, or duplicate headers return sanitize
 Keys are scoped to the authenticated user and the `run.create` operation across
 all their projects. They are retained indefinitely; no expiry or cleanup exists.
 The same key and semantic payload return **201**, the same Location, and the
-same persisted response. JSON spacing/order and UUID letter case do not matter.
+same stored creation response, even after lifecycle completion. JSON spacing/order
+and UUID letter case do not matter.
 A different valid project, artifact, or template with that key returns sanitized
 409. Unsupported templates still return 422. Authentication and resource
 ownership/artifact membership are checked before replay/conflict decisions, so
@@ -540,11 +543,103 @@ or contention may return sanitized 503. Retry uncertain results with the same
 key/payload. No in-memory lock is used. Fingerprints use versioned canonical JSON
 and SHA-256, not raw request bytes. Existing runs remain readable without keys.
 
-Runs remain queued and nothing executes them. Because status is currently
-immutable, re-rendering the stored run preserves its representation. Future
-lifecycle work must explicitly revisit replay behavior when status becomes mutable.
+Milestone 6C makes status mutable: replay now returns the immutable queued
+creation snapshot, while GET returns current lifecycle state. A replay never
+schedules another job or restarts processing.
 
 Apply explicitly with `docker compose run --rm --no-deps api /app/.venv/bin/alembic upgrade head`
-after rebuilding the API. Current head is `0005_run_idempotency`. Integration
+after rebuilding the API. Current head is `0006_simulated_lifecycle`. Integration
 checks use `LAVAN_POSTGRES_TESTS=1 uv run pytest` and disposable PostgreSQL
 databases, including synchronized concurrent writers and bounded lock contention.
+
+
+## Milestone 6C: durable simulated lifecycle
+
+New run creation commits the run, one `execution_jobs` row, idempotency record,
+and original six-field queued response snapshot together. POST/replay still
+returns 201 and the original Location/body after completion; GET at that Location
+shows current status. Fingerprint v1 is unchanged. Authentication, ownership,
+artifact membership, and conflict checks still apply on every replay.
+
+The migration verifies that all old runs are queued and backfills their creation
+snapshots. **It does not enqueue old runs.** Apply explicitly before starting the
+worker; never downgrade or reset development data:
+
+```bash
+docker compose up -d --wait --wait-timeout 60 postgres
+docker compose build api worker
+docker compose run --rm --no-deps api /app/.venv/bin/alembic upgrade head
+docker compose run --rm --no-deps api /app/.venv/bin/alembic current
+docker compose run --rm --no-deps api /app/.venv/bin/alembic heads
+docker compose up -d --wait --wait-timeout 60 api worker
+# Inspect service state and identifier-only worker messages:
+docker compose ps
+docker compose logs --tail 30 worker
+```
+
+The only forward path is `queued → preparing → starting → running → completed`.
+Any nonterminal state may become `failed`. Terminal states cannot be revived.
+Transitions lock the job and run, verify the live lease and fencing identity,
+and commit the run, ordered UUID transition event, and job result atomically.
+Events are internal transition records, with no streaming/logging API. Run
+updated_at and sanitized error_code are persisted internally; the public run
+response retains its existing six fields.
+
+`running` means a simulated test execution started; `completed` means it finished.
+**No app listens on a port. No upload is opened, extracted, installed, or executed.**
+A versioned runner request contains UUIDs, checksum, runtime template, stable
+operation ID, attempt, and fence; see [runner contract](docs/runner-contract.md).
+
+Workers claim one job at a time using `FOR UPDATE SKIP LOCKED`. Processing is
+at-least-once. Each processing claim increases attempts and fence, with a 5-second default
+lease renewed every tick; polling is 0.1 seconds by default and is capped to a
+third of the lease during processing. Database time determines expiry. Runner
+calls and waits occur outside transactions. Paused/stale owners cannot renew
+expired leases or apply results after reclamation. A worker crash leaves a lease
+that another worker can reclaim; SIGTERM stops claims and leaves in-flight work
+recoverable. There is no claim of exactly-once physical execution.
+
+Three attempts are allowed per job, including crashed claims. Infrastructure
+errors schedule a durable retry after `min(30, WORKER_RETRY_SECONDS * attempts)`
+seconds (base 1 second). Application startup failure is terminal immediately.
+An exhausted lease is finalized with a higher fence without another execution
+attempt. Exhausted errors/crash leases produce failed with retries_exhausted. Other stored
+codes are simulated_startup_failure and worker_error; no exception details are
+stored or logged. Connect/statement/lock waits are bounded; database outages
+leave the lease for later recovery.
+
+Local configuration selects `SIMULATOR_SCENARIO=success`, `startup_failure`, or
+`slow_startup`; no request can select a command or scenario. Startup (default
+0.1s, maximum 10s), slow startup (3s, maximum 30s), and duration (0.2s, maximum
+10s) are configurable. The scenario and timing are frozen on first claim, along
+with a persisted logical start anchor. Recovery reconciles that same execution
+instead of restarting its timer. Lease range is 0.2–60s; poll 0.01–1s; retry base
+0.05–30s. Defaults and variable names are in .env.example.
+
+To demonstrate failure for **new, unclaimed jobs**, stop the worker, recreate it
+with a local environment override, then create a new run using the authenticated
+POST example above and poll its Location with authenticated GET:
+
+```bash
+docker compose stop worker
+SIMULATOR_SCENARIO=startup_failure docker compose up -d --no-deps --force-recreate worker
+# After the new run reaches failed, restore the default success configuration:
+docker compose stop worker
+SIMULATOR_SCENARIO=success docker compose up -d --no-deps --force-recreate worker
+# For slow startup instead, use SIMULATOR_SCENARIO=slow_startup above.
+```
+
+Old queued runs require explicit local administration; this schedules simulation:
+
+```bash
+RUN_ID="<existing-queued-run-uuid>"
+docker compose run --rm --no-deps api /app/.venv/bin/python -m lavan.manage enqueue-run "$RUN_ID"
+# Repeating while queued returns the same job. Unknown/nonqueued runs are errors.
+```
+
+Run `LAVAN_POSTGRES_TESTS=1 uv run pytest` for disposable PostgreSQL tests,
+including real worker SIGKILL recovery, lease renewal, stale-worker rejection,
+retry exhaustion, snapshot backfill, and unchanged authentication constraints.
+Run Ruff checks and `uv sync --locked` as before. To stop after verification,
+`docker compose stop worker api postgres` preserves both development volumes.
+No cancellation, expiration, SSE, quotas, remote runner, or real execution exists.

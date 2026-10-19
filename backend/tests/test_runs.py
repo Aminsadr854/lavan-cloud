@@ -6,13 +6,13 @@ import pytest
 from alembic import command
 from conftest import migration
 from fastapi.testclient import TestClient
-from sqlalchemy import func, inspect, select
+from sqlalchemy import MetaData, Table, func, inspect, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 import lavan.auth as auth
 from lavan.api import create_app
-from lavan.models import ApiToken, Artifact, Project, Run, User, utc_now
+from lavan.models import ApiToken, Artifact, ExecutionJob, Project, Run, User, utc_now
 from lavan.tokens import new_token, token_digest
 
 
@@ -118,6 +118,14 @@ def test_create_persist_and_retrieve_queued_run(h):
         run = session.get(Run, UUID(body["id"]))
         assert run.project_id == h.projects[0] and run.artifact_id == h.artifacts[0]
         assert run.status == "queued" and not hasattr(run, "user_id")
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ExecutionJob)
+                .where(ExecutionJob.run_id == run.id)
+            )
+            == 1
+        )
     fetched = h.client.get(response.headers["location"], headers=h.headers())
     assert fetched.status_code == 200 and fetched.json() == body
 
@@ -263,7 +271,7 @@ def test_database_rejects_artifact_project_mismatch(h):
 
 @pytest.mark.parametrize(
     "field,value",
-    [("status", "running"), ("status", ""), ("runtime_template", "unsupported")],
+    [("status", "unsupported"), ("status", ""), ("runtime_template", "unsupported")],
 )
 def test_database_status_and_template_constraints(h, field, value):
     values = {
@@ -519,6 +527,14 @@ def test_concurrent_scoped_keys_separate_connections(h, monkeypatch, conflicting
         assert (
             session.scalar(
                 select(func.count())
+                .select_from(ExecutionJob)
+                .where(ExecutionJob.run_id == UUID(successful[0].json()["id"]))
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count())
                 .select_from(RunIdempotency)
                 .where(RunIdempotency.key == headers["Idempotency-Key"])
             )
@@ -542,6 +558,15 @@ def test_atomic_failure_leaves_neither_record(h, monkeypatch):
         assert (
             session.scalar(
                 select(func.count())
+                .select_from(ExecutionJob)
+                .join(Run, ExecutionJob.run_id == Run.id)
+                .where(Run.project_id == h.projects[0])
+            )
+            == 0
+        )
+        assert (
+            session.scalar(
+                select(func.count())
                 .select_from(RunIdempotency)
                 .where(RunIdempotency.key == headers["Idempotency-Key"])
             )
@@ -554,15 +579,18 @@ def test_upgrade_existing_runs_and_downgrade_only_disposable(h, migrated):
 
     engine, name = migrated
     migration(engine, name, command.downgrade, "0004_runs")
-    with Session(engine) as session:
-        run = Run(
-            project_id=h.projects[0],
-            artifact_id=h.artifacts[0],
-            runtime_template="python-fastapi-v1",
+    # Use the reflected historical table, not the current ORM mapping.
+    old_runs = Table("runs", MetaData(), autoload_with=engine)
+    run_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            old_runs.insert().values(
+                id=run_id,
+                project_id=h.projects[0],
+                artifact_id=h.artifacts[0],
+                runtime_template="python-fastapi-v1",
+            )
         )
-        session.add(run)
-        session.commit()
-        run_id = run.id
     migration(engine, name, command.upgrade, "head")
     response = h.client.get(
         f"/v1/projects/{h.projects[0]}/runs/{run_id}", headers=h.headers()
@@ -572,7 +600,10 @@ def test_upgrade_existing_runs_and_downgrade_only_disposable(h, migrated):
         assert session.scalar(select(func.count()).select_from(RunIdempotency)) == 0
     migration(engine, name, command.downgrade, "0004_runs")
     with Session(engine) as session:
-        assert session.get(Run, run_id) is not None
+        assert (
+            session.scalar(select(old_runs.c.id).where(old_runs.c.id == run_id))
+            == run_id
+        )
         assert "run_idempotency" not in inspect(session.connection()).get_table_names()
     migration(engine, name, command.upgrade, "head")
 
@@ -656,6 +687,7 @@ def test_scoped_key_lock_wait_is_bounded_and_rollback_is_atomic(h):
                 user_id=user_id,
                 operation=OPERATION,
                 key=headers["Idempotency-Key"],
+                creation_response={},
                 fingerprint=request_fingerprint(
                     h.projects[0], h.artifacts[0], "python-fastapi-v1"
                 ),

@@ -7,14 +7,17 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Integer,
     MetaData,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -104,7 +107,11 @@ class Run(Base):
             name="fk_runs_artifact_project",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("status = 'queued'", name="status_queued"),
+        CheckConstraint(
+            "status IN ('queued','preparing','starting','running',"
+            "'completed','failed')",
+            name="status_supported",
+        ),
         CheckConstraint(
             "runtime_template = 'python-fastapi-v1'", name="runtime_template_supported"
         ),
@@ -123,6 +130,11 @@ class Run(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    error_code: Mapped[str | None] = mapped_column(String(32))
+
 
 class RunIdempotency(Base):
     __tablename__ = "run_idempotency"
@@ -140,4 +152,66 @@ class RunIdempotency(Base):
     fingerprint: Mapped[str] = mapped_column(String(64))
     run_id: Mapped[UUID] = mapped_column(
         ForeignKey("runs.id", ondelete="RESTRICT"), unique=True
+    )
+
+    creation_response: Mapped[dict] = mapped_column(JSONB)
+
+
+class ExecutionJob(Base):
+    __tablename__ = "execution_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending','leased','completed','failed')", name="state_supported"
+        ),
+        CheckConstraint(
+            "attempts >= 0 AND fence >= 0 AND max_attempts BETWEEN 1 AND 10",
+            name="attempt_bounds",
+        ),
+        CheckConstraint(
+            "(state = 'leased' AND lease_owner IS NOT NULL "
+            "AND lease_until IS NOT NULL) OR (state <> 'leased' "
+            "AND lease_owner IS NULL AND lease_until IS NULL)",
+            name="lease_consistency",
+        ),
+        CheckConstraint(
+            "scenario IS NULL OR scenario IN "
+            "('success','startup_failure','slow_startup')",
+            name="scenario_supported",
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("runs.id", ondelete="RESTRICT"), unique=True
+    )
+    state: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending"
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    fence: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    lease_owner: Mapped[UUID | None] = mapped_column()
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(32))
+    scenario: Mapped[str | None] = mapped_column(String(32))
+    startup_seconds: Mapped[float | None] = mapped_column(Float)
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RunEvent(Base):
+    __tablename__ = "run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_run_events_run_sequence"),
+        CheckConstraint("sequence > 0", name="sequence_positive"),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    sequence: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))
+    error_code: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )

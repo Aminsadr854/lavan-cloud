@@ -192,7 +192,7 @@ def test_second_migration_preserves_users_on_downgrade(migrated):
         assert "api_tokens" in inspect(c).get_table_names()
         assert (
             c.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0005_run_idempotency"
+            == "0006_simulated_lifecycle"
         )
 
 

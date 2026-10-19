@@ -1,4 +1,4 @@
-"""Persist execution requests only. Nothing dispatches or executes these runs."""
+"""Owned execution requests with stable creation snapshots and durable jobs."""
 
 import hashlib
 import json
@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from lavan.auth import authenticated_user, get_session
-from lavan.models import Artifact, Project, Run, RunIdempotency, User
+from lavan.models import Artifact, ExecutionJob, Project, Run, RunIdempotency, User
 
 router = APIRouter(prefix="/v1/projects/{project_id}/runs")
 
@@ -30,7 +30,7 @@ class RunResponse(BaseModel):
     id: UUID
     project_id: UUID
     artifact_id: UUID
-    status: Literal["queued"]
+    status: Literal["queued", "preparing", "starting", "running", "completed", "failed"]
     runtime_template: Literal["python-fastapi-v1"]
     created_at: datetime
 
@@ -99,6 +99,8 @@ def create_run(
         )
         session.add(run)
         session.flush()
+        snapshot = RunResponse.model_validate(run).model_dump(mode="json")
+        session.add(ExecutionJob(run_id=run.id))
         inserted = session.execute(
             insert(RunIdempotency)
             .values(
@@ -107,6 +109,7 @@ def create_run(
                 key=keys[0],
                 fingerprint=fingerprint,
                 run_id=run.id,
+                creation_response=snapshot,
             )
             .on_conflict_do_nothing(constraint="pk_run_idempotency_scope")
             .returning(RunIdempotency.run_id)
@@ -136,7 +139,7 @@ def create_run(
     if run is None:
         raise HTTPException(404, "Not found")
     response.headers["Location"] = f"/v1/projects/{project_id}/runs/{run.id}"
-    return RunResponse.model_validate(run)
+    return RunResponse.model_validate(record.creation_response)
 
 
 @router.get("/{run_id}", response_model=RunResponse)

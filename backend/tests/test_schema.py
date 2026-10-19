@@ -29,6 +29,8 @@ def test_initial_upgrade_and_idempotence(migrated):
             "artifacts",
             "runs",
             "run_idempotency",
+            "execution_jobs",
+            "run_events",
         }
         assert inspector.get_pk_constraint("users")["name"] == "pk_users"
         assert inspector.get_pk_constraint("projects")["name"] == "pk_projects"
@@ -60,7 +62,7 @@ def test_initial_upgrade_and_idempotence(migrated):
             (c["name"], str(c["type"]), c["default"]) for c in after
         ]
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0005_run_idempotency"
+            "0006_simulated_lifecycle"
         )
 
 

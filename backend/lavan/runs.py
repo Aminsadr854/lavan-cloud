@@ -3,13 +3,13 @@
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -32,14 +32,28 @@ class RunResponse(BaseModel):
     project_id: UUID
     artifact_id: UUID
     status: Literal[
-        "queued", "preparing", "starting", "running", "completed", "failed", "stopped"
+        "queued",
+        "preparing",
+        "starting",
+        "running",
+        "completed",
+        "failed",
+        "stopped",
+        "expired",
     ]
     runtime_template: Literal["python-fastapi-v1"]
     created_at: datetime
 
 
+class RunCreationResponse(RunResponse):
+    expires_at: datetime
+    expiration_requested_at: datetime | None
+
+
 class RunCurrentResponse(RunResponse):
     cancellation_requested_at: datetime | None
+    expires_at: datetime | None
+    expiration_requested_at: datetime | None
 
 
 class CancelRequest(BaseModel):
@@ -81,7 +95,7 @@ def authorize_artifact(session, user_id, project_id, artifact_id):
         raise HTTPException(404, "Not found")
 
 
-@router.post("", status_code=201, response_model=RunResponse)
+@router.post("", status_code=201, response_model=RunCreationResponse | RunResponse)
 def create_run(
     project_id: UUID,
     payload: RunCreate,
@@ -103,14 +117,27 @@ def create_run(
     if record is None:
         # Bound concurrent-writer waits as well as driver connect timeouts.
         session.execute(text("SET LOCAL lock_timeout = '1500ms'"))
+        creation_clock = select(func.clock_timestamp().label("value")).cte()
+        created, deadline = session.execute(
+            select(
+                creation_clock.c.value,
+                creation_clock.c.value
+                + timedelta(
+                    seconds=request.app.state.settings.run_max_lifetime_seconds
+                ),
+            )
+        ).one()
         run = Run(
+            created_at=created,
+            updated_at=created,
+            expires_at=deadline,
             project_id=project_id,
             artifact_id=payload.artifact_id,
             runtime_template=payload.runtime_template,
         )
         session.add(run)
         session.flush()
-        snapshot = RunResponse.model_validate(run).model_dump(mode="json")
+        snapshot = RunCreationResponse.model_validate(run).model_dump(mode="json")
         session.add(ExecutionJob(run_id=run.id))
         inserted = session.execute(
             insert(RunIdempotency)
@@ -150,7 +177,10 @@ def create_run(
     if run is None:
         raise HTTPException(404, "Not found")
     response.headers["Location"] = f"/v1/projects/{project_id}/runs/{run.id}"
-    return RunResponse.model_validate(record.creation_response)
+    schema = (
+        RunCreationResponse if "expires_at" in record.creation_response else RunResponse
+    )
+    return schema.model_validate(record.creation_response)
 
 
 @router.get("/{run_id}", response_model=RunCurrentResponse)

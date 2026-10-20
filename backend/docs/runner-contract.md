@@ -91,4 +91,32 @@ and confirmed termination (including already-exited operations) with bounded RPC
 and fencing. A database flag or expired lease cannot prove physical termination.
 The current serial worker assumes nonblocking operations; arbitrary long RPCs
 would need heartbeat-capable adapters. Exactly-once physical execution, real
-sandbox control, expiration, and streaming remain outside this implementation.
+sandbox control and streaming remain outside this implementation. Expiration is
+covered by the following extension.
+
+## Version 1 expiration reuse (milestone 7B)
+
+`stop_requested_at` now carries the single selected durable stop instant, either
+cancellation or expiration. The same stable operation identity, idempotent `stop`
+and `inspect` acknowledgement, and fencing apply. The runner reports `stopped` as
+the execution acknowledgement; the backend maps the selected reason to terminal
+run/job `stopped` or `expired`. A deadline/expired lease alone is never a runner
+termination acknowledgement. No artifact payloads or new runner operations exist.
+
+PostgreSQL, not worker wall clocks, assigns and evaluates the run deadline.
+Workers check the shared intent/deadline selector before dispatch, on cooperative
+polls, and after results; normal writes and deferred transaction-end validation
+prevent completion/progression after expiry. Intent serialized first under the run
+lock selects the reason; a late cancellation observes a due deadline and selects
+expiration. Existing cancellation wins even if its reconciliation crosses expiry.
+Already committed terminal outcomes are final. The wrong intent timestamp is never
+written. Stop acknowledgement lost to SIGKILL is safely repeated with the same
+persisted anchor, including after lease recovery; delayed/stale results are fenced.
+
+Discovery continues during cooperative slow stop polls. Adapters must keep
+operations bounded/nonblocking to allow lease renewal and discovery; arbitrary
+blocking remote calls require a heartbeat-capable future adapter. Worker downtime
+can delay expiration, and stop transport failures remain pending until confirmed.
+No guarantee of physical termination is made without a real runner's confirmation.
+Old null-deadline runs retain their prior behavior; snapshot replays never refresh
+deadlines or restart execution. Expiration never deletes artifacts.

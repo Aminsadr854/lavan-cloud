@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     upload_max_seconds: float = Field(default=60, gt=0)
     upload_max_active: int = Field(default=2, ge=1)
 
+    run_max_lifetime_seconds: float = Field(default=900, gt=0, le=86400)
+    worker_expiration_batch_size: int = Field(default=50, ge=1, le=200)
+    worker_expiration_poll_seconds: float = Field(default=0.25, ge=0.02, le=5)
+
     worker_lease_seconds: float = Field(default=5, ge=0.2, le=60)
     worker_poll_seconds: float = Field(default=0.1, ge=0.01, le=1)
     worker_retry_seconds: float = Field(default=1, ge=0.05, le=30)

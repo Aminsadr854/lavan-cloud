@@ -1,4 +1,4 @@
-# Lavan backend: milestones 1–7A
+# Lavan backend: milestones 1–7B
 
 Local FastAPI infrastructure with minimal users/projects models and explicit
 Alembic migrations. Python 3.12, PostgreSQL 17, SQLAlchemy, Pydantic settings,
@@ -701,8 +701,7 @@ Pending retry/backoff jobs are made eligible immediately. Cancellation transport
 failures reschedule reconciliation after at most 0.25s (plus worker polling),
 without being relabeled as failed by the normal three-attempt budget. That normal
 counter is capped, while fencing epochs continue to increase. Cancellation intent
-is retained and reconciliation continues until acknowledgement; no expiration or
-cleanup exists. Normal runs retain their existing bounded retry policy.
+is retained and reconciliation continues until acknowledgement; no cleanup exists. Normal runs retain their existing bounded retry policy.
 
 A healthy available worker normally acknowledges the simulator within two seconds.
 With no worker or unavailable infrastructure, GET may remain pending; recovery of
@@ -728,4 +727,86 @@ services after updating. Revision is 0007_run_cancellation. Run
 `LAVAN_POSTGRES_TESTS=1 uv run pytest` for real PostgreSQL races, SIGKILL recovery,
 backoff, snapshot, and migration checks; Ruff and locked checks are unchanged.
 Restore the prior worker configuration/service states, and preserve both volumes.
-Expiration, SSE, log streaming, and real sandbox integration remain out of scope.
+The following milestone adds expiration; SSE, log streaming, and real sandbox
+integration remain out of scope.
+
+## Milestone 7B: automatic run expiration
+
+New runs receive a server-assigned `expires_at`, exactly
+`RUN_MAX_LIFETIME_SECONDS` after their PostgreSQL creation timestamp (default 900s,
+positive and at most 86400s). **Lifetime includes queue time.** Requests cannot
+supply/extend deadlines; claims, retries, recovery, and creation replays never
+extend them. PostgreSQL `clock_timestamp()` is the deadline authority, independent
+of worker clocks. No token or artifact retention policy changes.
+
+GET and cancellation responses expose nullable `expires_at` and
+`expiration_requested_at`. New creation bodies/snapshots include the deadline and
+null expiration intent. Existing stored creation snapshots are untouched and replay
+with their original fields, HTTP 201, and Location. Replays do not use mutable GET
+state. Existing runs retain null deadlines, are not automatically expired or
+scheduled, and can still be explicitly enqueued unless stopped/terminal.
+
+Apply `0008_run_expiration` using the explicit upgrade commands above before
+starting rebuilt API/worker images. Never downgrade development data. The worker
+finds due active runs using a partial deadline index and bounded batches
+(`WORKER_EXPIRATION_BATCH_SIZE=50`, range 1–200), including after restart and while
+polling a slow simulated operation. `WORKER_EXPIRATION_POLL_SECONDS=0.25` (range
+0.02–5) sets discovery cadence. Multiple workers use the same row locks, fencing,
+and unique event ordering. Busy rows are skipped and retried in later scans.
+
+Stop arbitration is shared by cancellation, discovery, claims, and transitions:
+
+- Existing committed terminal outcomes never change.
+- Under the run lock, an existing intent wins. A cancellation committed before
+  expiry selects `stopped`; a due deadline selects `expired`, including when a
+  late cancellation is the first observer. Only the selected timestamp is set.
+- One `expire_requested` event records expiration intent. Normal progression or
+  completion cannot commit after the deadline; a conditional SQL update and a
+  deferred PostgreSQL commit guard enforce the boundary. The worker then
+  reconciles the selected stop reason, rather than reporting a late completion.
+- A never-attempted queued run can expire inline during discovery without runner
+  start. Leased/previously attempted jobs require the existing idempotent runner
+  stop acknowledgement, even if a lease expired or retries were exhausted.
+- Backoff is made promptly eligible. Stop failures retain intent and retry with
+  bounded delay; they cannot justify claiming termination. A stale worker cannot
+  change an expired run. Explicit enqueue rejects an already due run.
+
+Expiration requires an available worker; absent workers, database outages, or
+lease recovery delay observation and acknowledgement. `expired` means the
+simulator acknowledged termination (or start was provably impossible), not that
+PostgreSQL stopped physical execution. A future real runner must confirm actual
+termination. Expiration never deletes artifact bytes, metadata, or other records.
+
+### Bounded local expiration verification
+
+Record prior service/configuration state and use a fresh project/artifact and the
+safe token-handling examples above. Do not change existing development deadlines.
+Use a short positive API lifetime and a slower simulated startup:
+
+```bash
+docker compose build api worker
+docker compose up -d --wait --wait-timeout 60 postgres
+docker compose run --rm --no-deps -T api /app/.venv/bin/alembic upgrade head
+RUN_MAX_LIFETIME_SECONDS=3 docker compose up -d --no-deps --force-recreate api
+SIMULATOR_SCENARIO=slow_startup SIMULATOR_SLOW_STARTUP_SECONDS=10 \
+  docker compose up -d --no-deps --force-recreate worker
+# Create a fresh run with the documented POST payload and Idempotency-Key.
+# Observe expires_at in its 201 response. Save the original body and Location.
+# Poll GET at most 100 times, 0.1s apart, with a 3s timeout per request.
+# Expect expired, expiration_requested_at set, cancellation_requested_at null.
+# Replay using the SAME key/payload: original queued body/deadline and HTTP 201.
+curl --fail-with-body --max-time 3 http://127.0.0.1:8000/health/live
+curl --fail-with-body --max-time 3 http://127.0.0.1:8000/health/ready
+# Revoke verification tokens; retain successful verification records/artifact.
+docker compose stop --timeout 10 api worker
+RUN_MAX_LIFETIME_SECONDS=900 docker compose up --no-start --no-deps --force-recreate api
+SIMULATOR_SCENARIO=success SIMULATOR_SLOW_STARTUP_SECONDS=3 \
+  docker compose up --no-start --no-deps --force-recreate worker
+# Restore any other original overrides and initial service states.
+# If PostgreSQL was initially stopped: docker compose stop --timeout 10 postgres
+```
+
+No source is read or executed. Run `LAVAN_POSTGRES_TESTS=1 uv run pytest` for
+real PostgreSQL deadline/race, local-clock independence, bounded discovery,
+SIGKILL recovery, snapshot-preservation, and migration tests. Destructive tests
+only target fixture-verified disposable databases, never lavan_dev.

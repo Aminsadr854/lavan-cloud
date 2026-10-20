@@ -151,5 +151,5 @@ def test_downgrade_refuses_to_discard_cancellation_history(migrated):
     with engine.connect() as c:
         assert (
             c.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0007_run_cancellation"
+            == "0008_run_expiration"
         )

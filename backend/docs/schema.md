@@ -205,3 +205,48 @@ Disposable migration tests preserve completed/failed jobs, queued unscheduled
 runs, and creation snapshots across upgrade/downgrade. Downgrade refuses any
 cancellation history rather than silently discard intent or relabel stopped runs.
 Development migrations remain upgrade-only, with all volumes and records retained.
+
+## Milestone 7B: PostgreSQL deadlines and shared stop arbitration
+
+`0008_run_expiration` adds nullable timestamptz `runs.expires_at` and
+`expiration_requested_at`, and terminal `expired` in run/job state constraints.
+Existing deadlines remain null; no old row is scheduled, and no creation snapshot,
+fingerprint, cancellation timestamp, or terminal outcome is rewritten.
+
+For API-created runs, a single PostgreSQL clock value supplies created_at and
+expires_at = created_at + the validated server lifetime (900s default). Queue time
+counts. The partial `(expires_at, id)` index covers only active runs with a deadline
+and neither stop intent. Worker discovery uses bounded index scans and separate
+short job-then-run locked transactions with SKIP LOCKED. Monotonic local time only
+schedules scans, not deadline eligibility. No new scheduler service exists.
+
+`ck_runs_positive_lifetime` requires deadline > created_at when present.
+`ck_runs_one_stop_reason` forbids simultaneous cancellation/expiration timestamps.
+Under the same run lock, the shared helper preserves any selected intent; otherwise
+PostgreSQL time chooses expiration if due, or explicit cancellation before expiry.
+Only that reason's timestamp and one ordered intent event are written. Expiration
+uses `expire_requested` (an intent marker, not a run status). Fenced acknowledgement
+writes `expired` and job result atomically; proven-unstarted queued runs can finish
+without calling the runner. Repeated discovery/cancellation cannot duplicate events.
+
+Normal state updates condition on a still-future deadline and absent intents.
+The deferred `ck_runs_deadline_commit` constraint trigger also checks PostgreSQL
+time at transaction end, preventing a previously inspected normal transition or
+outcome from committing after expiry. Its sanitized deadline race rolls back,
+then the worker durably selects/reconciles the stop intent. Completed/failed
+outcomes already committed before expiry remain terminal. Cancellation selected
+first finishes stopped even after the deadline. Neither reason overwrites the
+other, and an expired lease never proves a runner did not start.
+
+New creation JSONB snapshots contain the original six fields plus expires_at and
+null expiration_requested_at; cancellation remains excluded. Legacy snapshots
+retain their original exact stored JSON and field set. GET/cancel representations
+add both nullable expiration fields. Replay schema selection uses the stored
+snapshot version/fields, never current lifecycle state; fingerprints remain v1.
+
+Retries/claims do not update deadlines. Pending stop reconciliation bypasses long
+backoff and ordinary attempt exhaustion, retaining monotonically increasing
+fences until stop acknowledgement. No transaction is held across runner calls.
+Development migrations are upgrade-only. Disposable downgrade rejects nonnull
+deadlines/expiration history instead of silently discarding it. No data or artifact
+retention deletion accompanies expiration.

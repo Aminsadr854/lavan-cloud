@@ -11,15 +11,16 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from lavan.models import ExecutionJob, Project, Run, RunEvent
 
-TERMINAL = {"completed", "failed", "stopped"}
+TERMINAL = {"completed", "failed", "stopped", "expired"}
 TRANSITIONS = {
-    "queued": {"preparing", "failed", "stopped"},
-    "preparing": {"starting", "failed", "stopped"},
-    "starting": {"running", "failed", "stopped"},
-    "running": {"completed", "failed", "stopped"},
+    "queued": {"preparing", "failed", "stopped", "expired"},
+    "preparing": {"starting", "failed", "stopped", "expired"},
+    "starting": {"running", "failed", "stopped", "expired"},
+    "running": {"completed", "failed", "stopped", "expired"},
     "completed": set(),
     "failed": set(),
     "stopped": set(),
+    "expired": set(),
 }
 
 
@@ -28,7 +29,7 @@ class LostLease(Exception):
 
 
 class CancellationPending(Exception):
-    """A normal result cannot supersede committed cancellation intent."""
+    """A normal result cannot supersede a selected durable stop intent."""
 
 
 class CancellationBusy(Exception):
@@ -127,24 +128,119 @@ def _record_transition(session, run, target, clock, error_code=None):
     run.status, run.updated_at, run.error_code = target, clock, error_code
 
 
+def deadline_due(run, clock):
+    return run.expires_at is not None and run.expires_at <= clock
+
+
+def stop_target(run):
+    if run.cancellation_requested_at is not None:
+        return "stopped"
+    if run.expiration_requested_at is not None:
+        return "expired"
+    return None
+
+
+def stop_stamp(run):
+    return run.cancellation_requested_at or run.expiration_requested_at
+
+
+def select_stop_intent(session, run, *, cancel=False):
+    """Single arbitration point, called only with the run row locked."""
+    if run.status in TERMINAL:
+        return stop_target(run)
+    selected = stop_target(run)
+    if selected:
+        return selected
+    clock = now(session)
+    if deadline_due(run, clock):
+        run.expiration_requested_at = clock
+        marker, selected = "expire_requested", "expired"
+    elif cancel:
+        run.cancellation_requested_at = clock
+        marker, selected = "cancel_requested", "stopped"
+    else:
+        return None
+    run.updated_at = clock
+    append_event(session, run, marker, clock)
+    return selected
+
+
+def reconcile_stop(session, job, run, *, cancel=False):
+    """Persist intent, finalize provably unstarted runs, or wake reconciliation."""
+    if run.status in TERMINAL:
+        return False
+    target = select_stop_intent(session, run, cancel=cancel)
+    if target is None:
+        return False
+    clock = now(session)
+    never_started = run.status == "queued" and (
+        job is None
+        or (
+            job.state == "pending"
+            and job.attempts == 0
+            and job.fence == 0
+            and job.accepted_at is None
+        )
+    )
+    if never_started:
+        _record_transition(session, run, target, clock)
+        if job is not None:
+            job.state = target
+        return False
+    if job is None:
+        job = ExecutionJob(run_id=run.id)
+        session.add(job)
+    if job.state == "pending":
+        job.available_at = clock
+    return True
+
+
 def move(session, job, run, lease, target, error_code=None, *, stop_acknowledged=False):
-    """Shared worker transition path; caller holds job then run row locks."""
+    """Shared worker transition path; false commits a newly selected stop intent."""
     clock = verify(session, job, lease)
-    if run.cancellation_requested_at is not None and target != "stopped":
-        raise CancellationPending()
-    if target == "stopped" and (
-        not stop_acknowledged or run.cancellation_requested_at is None
+    selected = select_stop_intent(session, run)
+    if selected and target != selected:
+        return False
+    if target in {"stopped", "expired"} and (
+        not stop_acknowledged or target != selected
     ):
+        raise InvalidTransition()
+    if target not in TRANSITIONS[run.status]:
         raise InvalidTransition()
     if error_code not in {None, "simulated_startup_failure", "retries_exhausted"}:
         raise ValueError("Unsupported sanitized error code")
+    if selected is None:
+        # Atomic PostgreSQL-time guard at the write, not just a prior inspection.
+        changed = session.scalar(
+            update(Run)
+            .where(
+                Run.id == run.id,
+                Run.cancellation_requested_at.is_(None),
+                Run.expiration_requested_at.is_(None),
+                or_(Run.expires_at.is_(None), Run.expires_at > func.clock_timestamp()),
+            )
+            .values(
+                status=target, updated_at=func.clock_timestamp(), error_code=error_code
+            )
+            .returning(Run.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if changed is None:
+            select_stop_intent(session, run)
+            return False
+        append_event(session, run, target, changed, error_code)
+        set_committed_value(run, "status", target)
+        set_committed_value(run, "updated_at", changed)
+        set_committed_value(run, "error_code", error_code)
+    else:
+        _record_transition(session, run, target, clock, error_code)
     if target == "starting" and job.accepted_at is None:
         job.accepted_at = clock
-    _record_transition(session, run, target, clock, error_code)
     verify(session, job, lease)
     if target in TERMINAL:
         job.state = target
         job.lease_owner = job.lease_until = None
+    return True
 
 
 def request_cancellation(session, user_id, project_id, run_id):
@@ -179,41 +275,16 @@ def request_cancellation(session, user_id, project_id, run_id):
             # job/run order, never wait for its job while holding the run lock.
             session.rollback()
             continue
-        if run.status in TERMINAL:
-            return run, False
-        clock = now(session)
-        if run.cancellation_requested_at is None:
-            run.cancellation_requested_at = clock
-            run.updated_at = clock
-            append_event(session, run, "cancel_requested", clock)
-        never_started = run.status == "queued" and (
-            job is None
-            or (
-                job.state == "pending"
-                and job.attempts == 0
-                and job.fence == 0
-                and job.accepted_at is None
-            )
-        )
-        if never_started:
-            _record_transition(session, run, "stopped", clock)
-            if job is not None:
-                job.state = "stopped"
-            return run, False
-        if job is None:
-            # Conservative recovery for an internally restored attempted run.
-            job = ExecutionJob(run_id=run.id)
-            session.add(job)
-        if job.state == "pending":
-            job.available_at = clock  # cancellation bypasses normal retry backoff
-        return run, True
+        return run, reconcile_stop(session, job, run, cancel=True)
     raise CancellationBusy()
 
 
 def transition(engine, lease, target, error_code=None):
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
-        move(session, job, run, lease, target, error_code)
+        applied = move(session, job, run, lease, target, error_code)
+    if not applied:
+        raise CancellationPending()
 
 
 def claim(engine, settings, owner=None):
@@ -242,6 +313,10 @@ def claim(engine, settings, owner=None):
         if job is None:
             return None
         run = session.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
+        if run.status not in TERMINAL:
+            reconcile_stop(session, job, run)
+        if job.state in TERMINAL:
+            return None
         # Set a new fencing identity even when finalizing an exhausted crash lease.
         job.fence += 1
         job.state = "leased"
@@ -255,8 +330,11 @@ def claim(engine, settings, owner=None):
             job.state = run.status
             job.lease_owner = job.lease_until = None
             return None
-        if job.attempts >= job.max_attempts and run.cancellation_requested_at is None:
-            move(session, job, run, lease, "failed", "retries_exhausted")
+        if job.attempts >= job.max_attempts and stop_target(run) is None:
+            if not move(session, job, run, lease, "failed", "retries_exhausted"):
+                job.state = "pending"
+                job.lease_owner = job.lease_until = None
+                job.available_at = now(session)
             return None
         job.attempts = min(job.max_attempts, job.attempts + 1)
         if job.scenario is None:
@@ -274,7 +352,8 @@ def retry(engine, lease, settings):
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
         job.last_error_code = "worker_error"
-        if run.cancellation_requested_at is not None:
+        select_stop_intent(session, run)
+        if stop_target(run) is not None:
             verify(session, job, lease)
             job.available_at = now(session) + timedelta(
                 seconds=min(0.25, settings.worker_retry_seconds)
@@ -282,7 +361,10 @@ def retry(engine, lease, settings):
             job.state = "pending"
             job.lease_owner = job.lease_until = None
         elif job.attempts >= job.max_attempts:
-            move(session, job, run, lease, "failed", "retries_exhausted")
+            if not move(session, job, run, lease, "failed", "retries_exhausted"):
+                job.state = "pending"
+                job.lease_owner = job.lease_until = None
+                job.available_at = now(session)
         else:
             verify(session, job, lease)
             job.available_at = now(session) + timedelta(
@@ -296,6 +378,8 @@ def enqueue(session, run_id):
     run = session.scalar(select(Run).where(Run.id == run_id).with_for_update())
     if run is None:
         raise LookupError("Run not found.")
+    if stop_target(run) is not None or deadline_due(run, now(session)):
+        raise LookupError("Run deadline or stop intent prevents scheduling.")
     if run.status != "queued":
         raise LookupError("Only queued runs can be scheduled for simulation.")
     session.execute(
@@ -304,3 +388,54 @@ def enqueue(session, run_id):
         .on_conflict_do_nothing(constraint="uq_execution_jobs_run_id")
     )
     return session.scalar(select(ExecutionJob.id).where(ExecutionJob.run_id == run_id))
+
+
+def discover_due(engine, batch_size=50):
+    """Bounded indexed discovery. Lock jobs before runs; skip busy candidates."""
+    with Session(engine) as session:
+        clock = now(session)
+        ids = session.scalars(
+            select(Run.id)
+            .where(
+                Run.expires_at.is_not(None),
+                Run.expires_at <= clock,
+                Run.cancellation_requested_at.is_(None),
+                Run.expiration_requested_at.is_(None),
+                Run.status.in_(["queued", "preparing", "starting", "running"]),
+            )
+            .order_by(Run.expires_at, Run.id)
+            .limit(batch_size)
+        ).all()
+    processed = 0
+    for run_id in ids:
+        with Session(engine) as session, session.begin():
+            session.execute(text("SET LOCAL lock_timeout = '1000ms'"))
+            job = session.scalar(
+                select(ExecutionJob)
+                .where(ExecutionJob.run_id == run_id)
+                .with_for_update(skip_locked=True)
+            )
+            if (
+                job is None
+                and session.scalar(
+                    select(ExecutionJob.id).where(ExecutionJob.run_id == run_id)
+                )
+                is not None
+            ):
+                continue
+            run = session.scalar(
+                select(Run).where(Run.id == run_id).with_for_update(skip_locked=True)
+            )
+            if run is None:
+                continue
+            if (
+                job is None
+                and session.scalar(
+                    select(ExecutionJob.id).where(ExecutionJob.run_id == run_id)
+                )
+                is not None
+            ):
+                continue  # enqueue won; preserve lock order and retry next sweep
+            reconcile_stop(session, job, run)
+            processed += 1
+    return processed

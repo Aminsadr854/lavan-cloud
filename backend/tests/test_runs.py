@@ -6,7 +6,7 @@ import pytest
 from alembic import command
 from conftest import migration
 from fastapi.testclient import TestClient
-from sqlalchemy import MetaData, Table, func, inspect, select
+from sqlalchemy import MetaData, Table, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -102,6 +102,8 @@ def test_create_persist_and_retrieve_queued_run(h):
         "status",
         "runtime_template",
         "created_at",
+        "expires_at",
+        "expiration_requested_at",
     }
     assert body["project_id"] == str(h.projects[0]) and body["artifact_id"] == str(
         h.artifacts[0]
@@ -363,6 +365,12 @@ def test_successful_io_off_loop_and_session_cleanup(h, monkeypatch):
 def test_migration_downgrade_preserves_artifacts_then_reupgrade(h, migrated):
     assert h.create().status_code == 201
     engine, name = migrated
+    # This historical-schema test deletes run tables. Strip new deadlines only
+    # from its verified disposable fixture before exercising the legacy downgrade.
+    with engine.begin() as connection:
+        assert name.startswith("lavan_m2_test_")
+        assert connection.scalar(text("SELECT current_database()")) == name
+        connection.execute(update(Run).values(expires_at=None))
     migration(engine, name, command.downgrade, "0003_artifacts")
     with Session(engine) as session:
         assert "runs" not in inspect(session.connection()).get_table_names()
@@ -581,6 +589,12 @@ def test_upgrade_existing_runs_and_downgrade_only_disposable(h, migrated):
     from lavan.models import RunIdempotency
 
     engine, name = migrated
+    # This historical-schema test deletes run tables. Strip new deadlines only
+    # from its verified disposable fixture before exercising the legacy downgrade.
+    with engine.begin() as connection:
+        assert name.startswith("lavan_m2_test_")
+        assert connection.scalar(text("SELECT current_database()")) == name
+        connection.execute(update(Run).values(expires_at=None))
     migration(engine, name, command.downgrade, "0004_runs")
     # Use the reflected historical table, not the current ORM mapping.
     old_runs = Table("runs", MetaData(), autoload_with=engine)

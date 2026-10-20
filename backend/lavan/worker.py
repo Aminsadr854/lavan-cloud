@@ -4,13 +4,26 @@ import argparse
 import logging
 import signal
 from threading import Event
+from time import monotonic
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from lavan.config import Settings
 from lavan.db import database_engine
-from lavan.jobs import LostLease, claim, move, now, owned, renew, retry
+from lavan.jobs import (
+    LostLease,
+    claim,
+    discover_due,
+    move,
+    now,
+    owned,
+    renew,
+    retry,
+    select_stop_intent,
+    stop_stamp,
+)
 from lavan.models import Artifact
 from lavan.runner import RunnerRequest, SimulatedRunner
 
@@ -22,7 +35,8 @@ def tick(engine, lease, settings, runner):
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
         renew(session, job, lease, settings)
-        cancelling = run.cancellation_requested_at is not None
+        selected = select_stop_intent(session, run)
+        cancelling = selected is not None
         if not cancelling and run.status == "queued":
             move(session, job, run, lease, "preparing")
             return False
@@ -42,7 +56,7 @@ def tick(engine, lease, settings, runner):
             scenario=job.scenario,
             startup_seconds=job.startup_seconds,
             duration_seconds=job.duration_seconds,
-            stop_requested_at=run.cancellation_requested_at,
+            stop_requested_at=stop_stamp(run),
         )
         status = run.status
         clock = now(session)
@@ -59,36 +73,59 @@ def tick(engine, lease, settings, runner):
         raise ValueError("Unknown runner result")
     with Session(engine) as session, session.begin():
         job, run = owned(session, lease)
-        if run.cancellation_requested_at is not None:
+        current_target = select_stop_intent(session, run)
+        if current_target is not None:
             if cancelling and result == "stopped":
-                move(session, job, run, lease, "stopped", stop_acknowledged=True)
+                move(session, job, run, lease, current_target, stop_acknowledged=True)
                 return True
             return False  # intent won; discard a normal result and stop next tick
         if result == "stopped":
             raise ValueError("Unrequested runner stop")
         if result == "startup_failed":
-            move(session, job, run, lease, "failed", "simulated_startup_failure")
-            return True
+            return move(session, job, run, lease, "failed", "simulated_startup_failure")
         if run.status == "starting" and result in {"running", "completed"}:
             move(session, job, run, lease, "running")
         elif run.status == "running" and result == "completed":
-            move(session, job, run, lease, "completed")
-            return True
+            return move(session, job, run, lease, "completed")
     return False
 
 
-def process(engine, lease, settings, stop, runner=None):
+class ExpirationDiscovery:
+    """Local monotonic time schedules scans; PostgreSQL decides all eligibility."""
+
+    def __init__(self, engine, settings):
+        self.engine, self.settings, self.next_scan = engine, settings, 0.0
+
+    def poll(self):
+        if monotonic() < self.next_scan:
+            return
+        self.next_scan = monotonic() + self.settings.worker_expiration_poll_seconds
+        try:
+            discover_due(self.engine, self.settings.worker_expiration_batch_size)
+        except SQLAlchemyError:
+            log.warning("expiration_scan_unavailable")
+
+
+def process(engine, lease, settings, stop, runner=None, discovery=None):
     runner = runner or SimulatedRunner()
+    discovery = discovery or ExpirationDiscovery(engine, settings)
     while not stop.is_set():
+        discovery.poll()
         try:
             if tick(engine, lease, settings, runner):
                 return
         except LostLease:
             return
-        except Exception:
+        except Exception as error:
+            deadline_race = (
+                isinstance(error, IntegrityError)
+                and getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+                == "ck_runs_deadline_commit"
+            )
             # Do not log exception strings, SQL parameters, or runner payloads.
-            log.warning(
-                "worker_error job=%s run=%s fence=%s",
+            log.log(
+                logging.INFO if deadline_race else logging.WARNING,
+                "reconcile job=%s run=%s fence=%s",
                 lease.job_id,
                 lease.run_id,
                 lease.fence,
@@ -113,10 +150,12 @@ def main(argv=None):
         signal.signal(sig, lambda *_: stop.set())
     engine = database_engine()
     owner = uuid4()
+    discovery = ExpirationDiscovery(engine, settings)
     logging.basicConfig(level=logging.INFO)
     try:
         while not stop.is_set():
             try:
+                discovery.poll()
                 lease = claim(engine, settings, owner)
             except Exception:
                 log.warning("claim_unavailable")
@@ -131,7 +170,7 @@ def main(argv=None):
                     lease.run_id,
                     lease.fence,
                 )
-                process(engine, lease, settings, stop)
+                process(engine, lease, settings, stop, discovery=discovery)
             if args.once:
                 return 0
             stop.wait(settings.worker_poll_seconds)

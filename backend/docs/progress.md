@@ -765,3 +765,87 @@ until acknowledgement, without expiration. There is no physical execution to sto
 a future runner needs confirmed stop, deduplication, reconciliation, and fencing.
 No expiration, SSE, general log streaming, or real sandbox work was implemented.
 Milestone 7A is complete; no later milestone has started.
+
+## Milestone 7B — automatic run expiration
+
+Implemented PostgreSQL-assigned deadlines for new API runs (900s default, queue
+included), shared first-intent cancellation/expiration arbitration, terminal
+expired, and bounded indexed worker discovery. Old runs retain null deadlines;
+no historical job scheduling or creation snapshot rewrite occurred. Normal
+progression is guarded at the SQL write and deferred transaction end. Previously
+attempted work requires the existing simulator stop acknowledgement and current
+fencing identity. No artifact payloads are read and no artifact/data deletion exists.
+
+Verification:
+- **268 tests passed** with `LAVAN_POSTGRES_TESTS=1`; none skipped. This includes
+  old snapshot-byte preservation, legacy migration round trips, metadata check,
+  deadline assignment/replay, conflicting intent races, concurrent discovery,
+  batch/index use, stale acknowledgements, retry/backoff, slow-stop discovery,
+  expiry during normal transaction commit, and all previous behavior tests.
+- Real worker subprocess tests passed with deliberately wrong local wall clocks
+  (past/future), downtime beyond deadline, and SIGKILL after expiration stop
+  acknowledgement followed by higher-fence recovery. No long arbitrary sleeps.
+- Locked installation, Ruff lint/format, quiet Compose validation, Docker API/worker
+  builds, and Git whitespace checks passed. Dependencies remain unchanged. One
+  existing Starlette/HTTPX deprecation warning remains; no dependency upgrades.
+- Confirmed local Compose postgres:5432 / lavan_dev, upgraded existing revision
+  0007_run_cancellation to **0008_run_expiration**, current equals the single head,
+  and Alembic metadata comparison reports no pending operations. Initial counts
+  (13 users, 6 projects, 6 artifacts, 7 runs, 13 tokens, 6 idempotency records,
+  4 jobs, 13 events), run outcomes, cancellation timestamps and exact stored
+  snapshot digests were unchanged by migration. All old deadlines remained null.
+
+Actual HTTP/worker checks used a 3s lifetime and 10s slow startup. The final run
+was observed queued → preparing → starting → expired in 3.234069s after creation
+returned. It retained exactly one job (one attempt), one expire_requested event,
+and one expired event after simulator stop acknowledgement. No completed event
+or cancellation timestamp appeared. Replaying creation returned the original
+queued body/deadline/null intent with the same Location and 201. Late cancellation
+returned the unchanged expired representation with 200.
+
+| Final smoke request | HTTP | Seconds |
+| --- | --- | --- |
+| Create project | 201 | 0.378497 |
+| Upload inert ZIP | 201 | 0.081605 |
+| Create run | 201 | 0.104607 |
+| Observe expired | 200 | 0.028718 |
+| Replay creation | 201 | 0.036817 |
+| Late cancellation | 200 | 0.035379 |
+| Liveness | 200 | 0.005060 |
+
+**Remaining health-verification limitation:** readiness intermittently exceeds
+its unchanged 2s subprocess deadline on this host. Observed sanitized 503 durations
+were 2.006833–2.044488s; separate checks returned 200 in 1.925768s and 1.864118s.
+The final smoke readiness assertion failed with 503, so an entirely green health
+smoke is **not claimed**. API/worker logs had no warning/error markers. Readiness
+implementation/timeouts were preserved; reliability near its existing startup
+budget requires separate diagnosis. This is not evidence of a successful final
+readiness check. Expiration, replay and database/event checks passed independently.
+An earlier smoke attempt hit API startup before it was accepting connections;
+its token was still revoked. Subsequent attempts waited for liveness first.
+
+Retained successful local verification records (private files retained):
+- Run 9d7d9b98-65fd-4b0f-80bf-f69fffb02580; project 405c942a-5b14-4a27-9252-560f6a2aa5b9; artifact 1125eb2a-409c-45fc-8e48-b1b5a2553312; job 0d2a628e-4fb3-4a1d-8e39-51315a71b6b6. Events: preparing → starting → expire_requested → expired.
+- Run 344cdbce-b028-4c0f-95eb-7aa68cad7fef; project 256f0949-515c-43d1-84f3-aca55f707472; artifact f07e69fa-ac85-4011-a958-898b70ea8a9a; job a6d42f61-9bc9-4687-bad9-e998b343ad67. Events: preparing → starting → expire_requested → expired.
+
+Verification users and revoked token identifiers (never raw secrets):
+- User 4e81dc68-8027-4744-9f3a-ba046c6e1c23; revoked token ID e9fcf343-fb0e-475b-a860-89cc9eff2305.
+- User e482f16d-4a47-4a20-8b9f-3a0227a734ba; revoked token ID 630dcaf9-ef41-4467-9cfa-51efbb4e5171.
+- User d8c93d91-1bc9-4f84-b2f9-3e8e7eb3d035; revoked token ID c8a0d0e4-713f-4c34-ae3e-ef705cb0223b.
+
+All three verification tokens were revoked in cleanup, including interrupted/failed
+smoke attempts. Both successful projects/artifacts/runs, immutable replay records,
+jobs and events remain documented local test data. Existing records and both
+named volumes were preserved. No development reset/downgrade/stamp/deletion occurred.
+
+Final service state: API stopped (created), worker stopped (created), PostgreSQL
+stopped, matching the initial running/stopped state. Worker success scenario and
+all original timing/lease/poll/retry overrides were restored and compared against
+an initial nonsecret capture. API lifetime restored to its initial effective
+900s default; no .env edits. New discovery defaults are batch 50 / 0.25s.
+
+Limitations: expiration requires an available worker and acknowledged stop;
+worker downtime/lease recovery can delay finalization. Future physical termination
+requires a real runner acknowledgement. Old null-deadline runs retain their prior
+behavior. Artifact retention/deletion, SSE, and real sandbox integration were not
+implemented. No next milestone was started.

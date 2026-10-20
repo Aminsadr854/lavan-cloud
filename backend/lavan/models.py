@@ -10,12 +10,14 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     MetaData,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -109,8 +111,25 @@ class Run(Base):
         ),
         CheckConstraint(
             "status IN ('queued','preparing','starting','running',"
-            "'completed','failed','stopped')",
+            "'completed','failed','stopped','expired')",
             name="status_supported",
+        ),
+        CheckConstraint(
+            "cancellation_requested_at IS NULL OR expiration_requested_at IS NULL",
+            name="one_stop_reason",
+        ),
+        CheckConstraint(
+            "expires_at IS NULL OR expires_at > created_at", name="positive_lifetime"
+        ),
+        Index(
+            "ix_runs_expiration_due",
+            "expires_at",
+            "id",
+            postgresql_where=text(
+                "expires_at IS NOT NULL AND cancellation_requested_at IS NULL "
+                "AND expiration_requested_at IS NULL "
+                "AND status IN ('queued','preparing','starting','running')"
+            ),
         ),
         CheckConstraint(
             "runtime_template = 'python-fastapi-v1'", name="runtime_template_supported"
@@ -135,6 +154,11 @@ class Run(Base):
     )
     error_code: Mapped[str | None] = mapped_column(String(32))
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expiration_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
 
@@ -164,7 +188,7 @@ class ExecutionJob(Base):
     __tablename__ = "execution_jobs"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('pending','leased','completed','failed','stopped')",
+            "state IN ('pending','leased','completed','failed','stopped','expired')",
             name="state_supported",
         ),
         CheckConstraint(
